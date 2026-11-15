@@ -64,10 +64,26 @@ function DependenciesView.create(
 	-- =========================================================================
 	-- Top Filter & Controls Bar
 	-- =========================================================================
-	local filterPanel = UIComponents.createPanel(rootFrame, "DepFilterToolbar", UDim2.new(1, 0, 0, 114), 1)
+	local filterOuter = UIComponents.createPanel(rootFrame, "DepFilterToolbar", UDim2.new(1, 0, 0, 114), 1)
+	filterOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+	local filterPanel = Instance.new("Frame")
+	filterPanel.Name = "DepFilterToolbarContent"
+	filterPanel.Size = UDim2.fromScale(1, 1)
 	filterPanel.AutomaticSize = Enum.AutomaticSize.Y
-	UIComponents.createPadding(filterPanel, 10, 10, 12, 12)
+	filterPanel.BackgroundTransparency = 1
+	filterPanel.Parent = filterOuter
+	UIComponents.createPadding(filterPanel, 10, 12, 12, 14)
 	UIComponents.createListLayout(filterPanel, Enum.FillDirection.Vertical, 7)
+
+	UIComponents.attachPanelEdgeResizers(filterOuter, {
+		minHeight = 76,
+		maxHeight = 300,
+		minWidth = 360,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local topRow = Instance.new("Frame")
 	topRow.Name = "TopSearchAndTreeControls"
@@ -140,6 +156,9 @@ function DependenciesView.create(
 		{
 			{ id = "All", label = "All" },
 			{ id = "Resolved", label = "Resolved" },
+			{ id = "Static", label = "Static" },
+			{ id = "Dynamic", label = "Dynamic / Loop" },
+			{ id = "Conditional", label = "Conditional" },
 			{ id = "Unresolved", label = "Unresolved / Partial" },
 		},
 		"All",
@@ -180,12 +199,12 @@ function DependenciesView.create(
 	splitArea.Parent = rootFrame
 
 	local function syncSplitLayout()
-		local panelHeight = math.max(114, filterPanel.AbsoluteSize.Y)
+		local panelHeight = math.max(76, filterOuter.AbsoluteSize.Y)
 		local topOffset = panelHeight + 8
 		splitArea.Position = UDim2.fromOffset(0, topOffset)
 		splitArea.Size = UDim2.new(1, 0, 1, -topOffset)
 	end
-	table.insert(viewConnections, filterPanel:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncSplitLayout))
+	table.insert(viewConnections, filterOuter:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncSplitLayout))
 	syncSplitLayout()
 
 	local treePanel = UIComponents.createPanel(splitArea, "TreePanel", UDim2.new(0.56, -5, 1, 0), 1)
@@ -198,6 +217,35 @@ function DependenciesView.create(
 	local detailScroll = UIComponents.createScrollFrame(detailPanel, "DepDetailScroll", UDim2.fromScale(1, 1), 1)
 	UIComponents.createPadding(detailScroll, 10, 12, 10, 10)
 	UIComponents.createListLayout(detailScroll, Enum.FillDirection.Vertical, 8)
+
+	-- Interactive split resizer between Dependency Tree (left) and Dependency Details (right)
+	UIComponents.attachHorizontalSplitResizer(
+		splitArea,
+		treePanel,
+		detailPanel,
+		0.56,
+		0.25,
+		0.78,
+		viewConnections
+	)
+
+	-- Edge resizers on both panels
+	UIComponents.attachPanelEdgeResizers(treePanel, {
+		minHeight = 140,
+		maxHeight = 1200,
+		enableBottom = true,
+		enableRight = false,
+		enableCorner = false,
+	}, viewConnections)
+
+	UIComponents.attachPanelEdgeResizers(detailPanel, {
+		minHeight = 140,
+		maxHeight = 1200,
+		minWidth = 220,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local nodeRowButtons: { [string]: TextButton } = {}
 
@@ -219,6 +267,12 @@ function DependenciesView.create(
 
 	local function recordMatchesFilters(rec: DependencyRecord): boolean
 		if filterStatus == "Resolved" and rec.status ~= "Resolved" then
+			return false
+		elseif filterStatus == "Static" and rec.classification ~= "Static" then
+			return false
+		elseif filterStatus == "Dynamic" and not rec.isDynamic then
+			return false
+		elseif filterStatus == "Conditional" and not rec.isConditional then
 			return false
 		elseif filterStatus == "Unresolved" and rec.status == "Resolved" then
 			return false
@@ -476,31 +530,70 @@ function DependenciesView.create(
 			UIComponents.createPadding(callCard, 8, 8, 8, 8)
 			UIComponents.createListLayout(callCard, Enum.FillDirection.Vertical, 4)
 
-			UIComponents.createKeyValueRow(callCard, "Source Line", string.format("Line %d", rec.lineNumber), nil, 1)
+			UIComponents.createKeyValueRow(
+				callCard,
+				"Source Location",
+				string.format("Line %d, Column %d", rec.lineNumber, rec.columnNumber),
+				nil,
+				1
+			)
 			UIComponents.createKeyValueRow(
 				callCard,
 				"Require Scope",
-				if rec.isTopLevel
-					then "Top-Level (Executes synchronously when caller initializes)"
-					else "Function / Inner Block Scope (Deferred until block executes)",
+				string.format(
+					"%s (%s)",
+					rec.scopeKind,
+					if rec.isTopLevel
+						then "Executes synchronously when caller initializes"
+						else "Deferred until enclosing block/loop/function executes"
+				),
 				if rec.isTopLevel then Theme.Colors.InfoText else Theme.Colors.WarningText,
 				2
 			)
-			UIComponents.createKeyValueRow(callCard, "Resolution Status", rec.status, nil, 3)
+			UIComponents.createKeyValueRow(
+				callCard,
+				"Classification",
+				rec.classification,
+				if rec.classification == "Static"
+					then Theme.Colors.SuccessText
+					elseif rec.classification == "DynamicResolved" then Theme.Colors.DynamicCyanText
+					elseif rec.classification == "Conditional" then Theme.Colors.WarningText
+					else Theme.Colors.OrangeText,
+				3
+			)
+			UIComponents.createKeyValueRow(callCard, "Resolution Status", rec.status, nil, 4)
 			UIComponents.createKeyValueRow(
 				callCard,
 				"Raw Expression",
 				string.format("require(%s)", rec.rawExpression),
 				Theme.Colors.TextSecondary,
-				4
+				5
 			)
+			if rec.conditionExpression ~= nil then
+				UIComponents.createKeyValueRow(
+					callCard,
+					"Guard Condition",
+					rec.conditionExpression,
+					Theme.Colors.WarningText,
+					6
+				)
+			end
+			if rec.candidateModulePaths ~= nil and #rec.candidateModulePaths > 0 then
+				UIComponents.createKeyValueRow(
+					callCard,
+					"Candidate Set",
+					string.format("%d candidate ModuleScript(s) in loop/collection", #rec.candidateModulePaths),
+					Theme.Colors.DynamicCyanText,
+					7
+				)
+			end
 			if rec.usedAlias ~= nil then
 				UIComponents.createKeyValueRow(
 					callCard,
 					"Resolved Via Alias",
-					string.format("Local variable '%s'", rec.usedAlias),
+					string.format("Variable / Iterator '%s'", rec.usedAlias),
 					Theme.Colors.InfoText,
-					5
+					8
 				)
 			end
 			return
@@ -628,7 +721,7 @@ function DependenciesView.create(
 			cycleNote.TextColor3 = Theme.Colors.TextSecondary
 			cycleNote.TextXAlignment = Enum.TextXAlignment.Left
 			cycleNote.TextWrapped = true
-			cycleNote.Text = "Note: Static cycles are not always runtime errors if require() calls occur inside deferred functions, but top-level mutual requires will deadlock."
+			cycleNote.Text = "Note: Cyclic ModuleScript requires work at top level ONLY if the Roblox Studio Beta feature 'Luau Modularity: Export Values and Cyclic Requires' is enabled (or if require() calls are deferred inside functions). Without the beta feature enabled, top-level mutual requires will error/deadlock."
 			cycleNote.Parent = cycleBanner
 
 			for cIdx, chain in depAnalysis.circularChains do
@@ -761,12 +854,11 @@ function DependenciesView.create(
 					)
 				end
 
-				-- Class / Status Badge
+				-- Class / Classification Badge
 				if rec.status == "Resolved" then
 					UIComponents.createClassBadge(rowContent, "ModuleScript", true, 3)
-				else
-					UIComponents.createResolutionBadge(rowContent, rec.status, 3)
 				end
+				UIComponents.createClassificationBadge(rowContent, rec.classification, 4)
 
 				-- Readable Target Name (avoid long paths inline!)
 				local displayName = if rec.status == "Resolved" and rec.resolvedModuleName ~= nil
@@ -774,7 +866,7 @@ function DependenciesView.create(
 					else string.format("require(%s)", rec.rawExpression)
 
 				local nameLbl = Instance.new("TextLabel")
-				nameLbl.LayoutOrder = 4
+				nameLbl.LayoutOrder = 5
 				nameLbl.Size = UDim2.fromOffset(0, 24)
 				nameLbl.AutomaticSize = Enum.AutomaticSize.X
 				nameLbl.BackgroundTransparency = 1
@@ -786,9 +878,9 @@ function DependenciesView.create(
 				nameLbl.Text = displayName
 				nameLbl.Parent = rowContent
 
-				-- Line & Scope tag
+				-- Line, Column & Scope tag
 				local metaLbl = Instance.new("TextLabel")
-				metaLbl.LayoutOrder = 5
+				metaLbl.LayoutOrder = 6
 				metaLbl.Size = UDim2.fromOffset(0, 24)
 				metaLbl.AutomaticSize = Enum.AutomaticSize.X
 				metaLbl.BackgroundTransparency = 1
@@ -796,9 +888,10 @@ function DependenciesView.create(
 				metaLbl.TextSize = 11
 				metaLbl.TextColor3 = Theme.Colors.TextMuted
 				metaLbl.Text = string.format(
-					"(L%d, %s)",
+					"(L%d:%d, %s)",
 					rec.lineNumber,
-					if rec.isTopLevel then "top-level" else "fn-scope"
+					rec.columnNumber,
+					rec.scopeKind
 				)
 				metaLbl.Parent = rowContent
 
@@ -808,7 +901,7 @@ function DependenciesView.create(
 						"CIRCULAR",
 						Theme.Colors.DangerText,
 						Theme.Colors.DangerBg,
-						6
+						7
 					)
 				end
 

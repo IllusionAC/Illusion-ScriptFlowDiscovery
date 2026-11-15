@@ -57,14 +57,31 @@ export type DiscoveredScript = {
 
 export type ResolutionStatus = "Resolved" | "PartiallyResolved" | "Unresolved"
 
+export type DependencyClassification =
+	"Static"
+	| "DynamicResolved"
+	| "DynamicPartial"
+	| "Conditional"
+	| "Unresolved"
+
+export type RequireScopeKind = "TopLevel" | "Function" | "Loop" | "Conditional"
+
 export type DependencyRecord = {
 	requiringScriptPath: string,
 	requiringScriptName: string,
 	requiringScriptClass: ScriptClassName,
 	rawExpression: string,
 	lineNumber: number,
+	columnNumber: number,
 	isTopLevel: boolean,
+	scopeKind: RequireScopeKind,
 	status: ResolutionStatus,
+	classification: DependencyClassification,
+	isDynamic: boolean,
+	isConditional: boolean,
+	conditionExpression: string?,
+	candidateModulePaths: { string }?,
+	expansionGroupId: string?,
 	resolvedModulePath: string?,
 	resolvedModuleName: string?,
 	resolvedInstance: ModuleScript?,
@@ -159,6 +176,137 @@ export type ScanReport = {
 }
 
 export type NavigationTab = "Overview" | "Scripts" | "Dependencies" | "Execution"
+
+-- =============================================================================
+-- Iteration 3: Game Architecture Graph Model & Layout Types
+-- =============================================================================
+
+export type GraphNodeType =
+	"Service"
+	| "Folder"
+	| "Model"
+	| "Container"
+	| "Script"
+	| "LocalScript"
+	| "ModuleScript"
+
+export type GraphEdgeKind = "Structural" | "Dependency"
+
+export type GraphNode = {
+	id: string,
+	name: string,
+	fullPath: string,
+	nodeType: GraphNodeType,
+	className: string,
+	instance: Instance?,
+	parentId: string?,
+	childIds: { string },
+	serviceName: string,
+	depth: number,
+	isContainer: boolean,
+	isScript: boolean,
+	scriptInfo: DiscoveredScript?,
+	environment: string?,
+	dependencyCount: number,
+	dependentCount: number,
+	childScriptCount: number,
+	outgoingEdgeIds: { string },
+	incomingEdgeIds: { string },
+}
+
+export type GraphEdge = {
+	id: string,
+	kind: GraphEdgeKind,
+	sourceNodeId: string,
+	targetNodeId: string,
+	classification: DependencyClassification?,
+	status: ResolutionStatus?,
+	rawExpression: string?,
+	lineNumber: number?,
+	columnNumber: number?,
+	scopeKind: RequireScopeKind?,
+	conditionExpression: string?,
+	isCircular: boolean,
+	isDynamic: boolean,
+	isConditional: boolean,
+	candidateCount: number?,
+	dependencyRecord: DependencyRecord?,
+}
+
+export type GraphModel = {
+	nodesById: { [string]: GraphNode },
+	orderedNodes: { GraphNode },
+	rootNodeIds: { string },
+	structuralEdges: { GraphEdge },
+	dependencyEdges: { GraphEdge },
+	allEdgesById: { [string]: GraphEdge },
+}
+
+export type GraphPoint2D = {
+	x: number,
+	y: number,
+}
+
+export type GraphControlPointData = {
+	position: GraphPoint2D,
+	leftTangent: GraphPoint2D,
+	rightTangent: GraphPoint2D,
+}
+
+export type GraphLayoutNode = {
+	id: string,
+	node: GraphNode,
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+	layer: number,
+	orderInLayer: number,
+	isCollapsed: boolean,
+	visible: boolean,
+}
+
+export type GraphLayoutEdge = {
+	id: string,
+	edge: GraphEdge,
+	sourceNodeId: string,
+	targetNodeId: string,
+	startPoint: GraphPoint2D,
+	endPoint: GraphPoint2D,
+	midpoint: GraphPoint2D,
+	arrowDirection: GraphPoint2D,
+	controlPoints: { GraphControlPointData },
+	visible: boolean,
+}
+
+export type GraphLayoutResult = {
+	layoutNodesById: { [string]: GraphLayoutNode },
+	orderedLayoutNodes: { GraphLayoutNode },
+	layoutEdges: { GraphLayoutEdge },
+	canvasWidth: number,
+	canvasHeight: number,
+}
+
+export type GraphFilterState = {
+	showContainers: boolean,
+	showScripts: boolean,
+	showLocalScripts: boolean,
+	showModuleScripts: boolean,
+	showStructuralEdges: boolean,
+	showDependencyEdges: boolean,
+	showDynamicDependencies: boolean,
+	searchQuery: string,
+}
+
+export type Path2DValidationResult = {
+	supported: boolean,
+	canInstantiate: boolean,
+	canParentToGuiObject: boolean,
+	canSetControlPoints: boolean,
+	canStyleProperties: boolean,
+	canQueryCurveGeometry: boolean,
+	diagnosticMessage: string,
+}
 
 local Types = {}
 

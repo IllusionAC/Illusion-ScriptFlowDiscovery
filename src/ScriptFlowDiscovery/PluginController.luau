@@ -67,15 +67,16 @@ function PluginController.initialize(pluginInstance: Plugin): ControllerInstance
 		Enum.InitialDockState.Float,
 		false,
 		false,
-		760,
+		920,
+		640,
 		520,
-		480,
-		320
+		360
 	)
 
 	local dockWidget = pluginInstance:CreateDockWidgetPluginGuiAsync(WIDGET_ID, widgetInfo)
 	dockWidget.Title = "Illusion's ScriptFlowDiscovery"
 	dockWidget.Name = "IllusionScriptFlowDiscovery"
+	dockWidget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 	local triggerScan: () -> ScanReport
 

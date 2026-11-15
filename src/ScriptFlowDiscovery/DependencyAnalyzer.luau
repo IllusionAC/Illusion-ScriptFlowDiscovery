@@ -1,9 +1,10 @@
 --!strict
 --[[
 	DependencyAnalyzer.luau
-	Performs static lexical and syntactic analysis of Luau script sources to discover
-	require() calls, resolve static Instance/ModuleScript paths against the DataModel,
-	and report unresolved or partially resolved dynamic expressions.
+	Performs static lexical, syntactic, and scoped data-flow analysis of Luau script
+	sources to discover require() calls, resolve static and dynamic/loop Instance and
+	ModuleScript paths against the DataModel, evaluate static conditional guards,
+	and classify all dependency relationships.
 ]]
 
 local Types = require("./Types")
@@ -12,15 +13,18 @@ local ScriptDiscovery = require("./ScriptDiscovery")
 type DiscoveredScript = Types.DiscoveredScript
 type DependencyRecord = Types.DependencyRecord
 type ResolutionStatus = Types.ResolutionStatus
+type DependencyClassification = Types.DependencyClassification
+type RequireScopeKind = Types.RequireScopeKind
 type ScriptDependencySummary = Types.ScriptDependencySummary
 type DependencyAnalysisResult = Types.DependencyAnalysisResult
 
 type TokenKind = "Identifier" | "Keyword" | "String" | "InterpolatedString" | "Number" | "Symbol"
 
-type Token = {
+export type Token = {
 	kind: TokenKind,
 	value: string,
 	line: number,
+	column: number,
 	rawStart: number,
 	rawEnd: number,
 	blockDepth: number,
@@ -32,6 +36,35 @@ type PathEvalResult = {
 	partialBasePath: string?,
 	failureReason: string?,
 	usedAlias: string?,
+}
+
+type CollectionSourceKind =
+	"GetChildren"
+	| "GetDescendants"
+	| "TableLiteral"
+	| "InstanceChildren"
+	| "Unknown"
+
+type CollectionEvalResult = {
+	status: ResolutionStatus,
+	instances: { Instance },
+	basePath: string?,
+	sourceKind: CollectionSourceKind,
+	failureReason: string?,
+	usedAlias: string?,
+}
+
+type ScopeFrameKind = "Function" | "Loop" | "Conditional" | "DoBlock"
+
+type ScopeFrame = {
+	frameKind: ScopeFrameKind,
+	loopVarName: string?,
+	loopKeyVarName: string?,
+	loopEval: CollectionEvalResult?,
+	condStartIdx: number?,
+	condEndIdx: number?,
+	condRawText: string?,
+	isElseBranch: boolean?,
 }
 
 local DependencyAnalyzer = {}
@@ -90,16 +123,24 @@ local function matchLongBracketOpen(source: string, pos: number): (number?, numb
 	return nil, 0
 end
 
--- Scans until matching closing long bracket `]==]`, updating line count
-local function scanLongBracketClose(source: string, startPos: number, eqCount: number, startLine: number): (number, number, string)
+-- Scans until matching closing long bracket `]==]`, updating line count and lineStartPos
+local function scanLongBracketClose(
+	source: string,
+	startPos: number,
+	eqCount: number,
+	startLine: number,
+	initialLineStartPos: number
+): (number, number, number, string)
 	local len = #source
 	local cursor = startPos
 	local line = startLine
+	local lineStartPos = initialLineStartPos
 
 	while cursor <= len do
 		local b = string.byte(source, cursor)
 		if b == 10 then -- '\n'
 			line += 1
+			lineStartPos = cursor + 1
 			cursor += 1
 		elseif b == 93 then -- ']'
 			local check = cursor + 1
@@ -110,7 +151,7 @@ local function scanLongBracketClose(source: string, startPos: number, eqCount: n
 			end
 			if matchedEq == eqCount and check <= len and string.byte(source, check) == 93 then
 				local content = string.sub(source, startPos, cursor - 1)
-				return check + 1, line, content
+				return check + 1, line, lineStartPos, content
 			end
 			cursor += 1
 		else
@@ -119,7 +160,7 @@ local function scanLongBracketClose(source: string, startPos: number, eqCount: n
 	end
 
 	local remaining = string.sub(source, startPos, len)
-	return len + 1, line, remaining
+	return len + 1, line, lineStartPos, remaining
 end
 
 local function pushToken(list: { Token }, tok: Token)
@@ -130,11 +171,16 @@ local function pushRecord(list: { DependencyRecord }, rec: DependencyRecord)
 	table.insert(list, rec)
 end
 
+local function pushScopeFrame(stack: { ScopeFrame }, frame: ScopeFrame)
+	table.insert(stack, frame)
+end
+
 function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 	local tokens: { Token } = {}
 	local len = #source
 	local pos = 1
 	local line = 1
+	local lineStartPos = 1
 	local blockDepth = 0
 	local pendingLoopHeader = false
 
@@ -145,6 +191,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 		if b == 32 or b == 9 or b == 13 or b == 10 then
 			if b == 10 then
 				line += 1
+				lineStartPos = pos + 1
 			end
 			pos += 1
 
@@ -153,9 +200,11 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 			local commentStart = pos + 2
 			local longStart, eqCount = matchLongBracketOpen(source, commentStart)
 			if longStart ~= nil then
-				local nextPos, nextLine, _ = scanLongBracketClose(source, longStart, eqCount, line)
+				local nextPos, nextLine, nextLineStart, _ =
+					scanLongBracketClose(source, longStart, eqCount, line, lineStartPos)
 				pos = nextPos
 				line = nextLine
+				lineStartPos = nextLineStart
 			else
 				pos = commentStart
 				while pos <= len and string.byte(source, pos) ~= 10 do
@@ -169,22 +218,27 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 			if longStart ~= nil then
 				local rawStart = pos
 				local tokenLine = line
-				local nextPos, nextLine, content = scanLongBracketClose(source, longStart, eqCount, line)
+				local tokenCol = rawStart - lineStartPos + 1
+				local nextPos, nextLine, nextLineStart, content =
+					scanLongBracketClose(source, longStart, eqCount, line, lineStartPos)
 				pushToken(tokens, {
 					kind = "String",
 					value = content,
 					line = tokenLine,
+					column = tokenCol,
 					rawStart = rawStart,
 					rawEnd = nextPos - 1,
 					blockDepth = blockDepth,
 				})
 				pos = nextPos
 				line = nextLine
+				lineStartPos = nextLineStart
 			else
 				pushToken(tokens, {
 					kind = "Symbol",
 					value = "[",
 					line = line,
+					column = pos - lineStartPos + 1,
 					rawStart = pos,
 					rawEnd = pos,
 					blockDepth = blockDepth,
@@ -197,6 +251,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 			local quoteByte = b
 			local rawStart = pos
 			local tokenLine = line
+			local tokenCol = rawStart - lineStartPos + 1
 			pos += 1
 			local chars: { string } = {}
 			while pos <= len do
@@ -206,6 +261,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 						local nextByte = string.byte(source, pos + 1)
 						if nextByte == 10 then
 							line += 1
+							lineStartPos = pos + 2
 						end
 						table.insert(chars, string.sub(source, pos + 1, pos + 1))
 						pos += 2
@@ -217,6 +273,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 					break
 				elseif cb == 10 then
 					line += 1
+					lineStartPos = pos + 1
 					pos += 1
 					break
 				else
@@ -228,6 +285,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 				kind = "String",
 				value = table.concat(chars),
 				line = tokenLine,
+				column = tokenCol,
 				rawStart = rawStart,
 				rawEnd = pos - 1,
 				blockDepth = blockDepth,
@@ -237,6 +295,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 		elseif b == 96 then
 			local rawStart = pos
 			local tokenLine = line
+			local tokenCol = rawStart - lineStartPos + 1
 			pos += 1
 			while pos <= len do
 				local cb = string.byte(source, pos)
@@ -247,6 +306,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 					break
 				elseif cb == 10 then
 					line += 1
+					lineStartPos = pos + 1
 					pos += 1
 				else
 					pos += 1
@@ -256,6 +316,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 				kind = "InterpolatedString",
 				value = string.sub(source, rawStart, pos - 1),
 				line = tokenLine,
+				column = tokenCol,
 				rawStart = rawStart,
 				rawEnd = pos - 1,
 				blockDepth = blockDepth,
@@ -264,6 +325,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 		-- Identifier or Keyword
 		elseif isAlpha(b) then
 			local rawStart = pos
+			local tokenCol = rawStart - lineStartPos + 1
 			pos += 1
 			while pos <= len and isAlphaNumeric(string.byte(source, pos)) do
 				pos += 1
@@ -294,6 +356,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 				kind = if isKw then "Keyword" else "Identifier",
 				value = word,
 				line = line,
+				column = tokenCol,
 				rawStart = rawStart,
 				rawEnd = pos - 1,
 				blockDepth = tokenBlockDepth,
@@ -302,10 +365,11 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 		-- Number literal
 		elseif isDigit(b) then
 			local rawStart = pos
+			local tokenCol = rawStart - lineStartPos + 1
 			pos += 1
 			while pos <= len do
 				local nb = string.byte(source, pos)
-				if isAlphaNumeric(nb) or nb == 46 then -- allow hex, binary, decimals, underscores
+				if isAlphaNumeric(nb) or nb == 46 then
 					pos += 1
 				else
 					break
@@ -315,6 +379,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 				kind = "Number",
 				value = string.sub(source, rawStart, pos - 1),
 				line = line,
+				column = tokenCol,
 				rawStart = rawStart,
 				rawEnd = pos - 1,
 				blockDepth = blockDepth,
@@ -323,10 +388,19 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 		-- Multi-character or single-character symbols
 		else
 			local rawStart = pos
+			local tokenCol = rawStart - lineStartPos + 1
 			local sym = string.sub(source, pos, pos)
 			if pos + 1 <= len then
 				local twoChar = string.sub(source, pos, pos + 1)
-				if twoChar == "::" or twoChar == ".." or twoChar == "==" or twoChar == "~=" or twoChar == "<=" or twoChar == ">=" or twoChar == "->" then
+				if
+					twoChar == "::"
+					or twoChar == ".."
+					or twoChar == "=="
+					or twoChar == "~="
+					or twoChar == "<="
+					or twoChar == ">="
+					or twoChar == "->"
+				then
 					sym = twoChar
 					pos += 2
 				else
@@ -339,6 +413,7 @@ function DependencyAnalyzer.tokenizeLuau(source: string): { Token }
 				kind = "Symbol",
 				value = sym,
 				line = line,
+				column = tokenCol,
 				rawStart = rawStart,
 				rawEnd = pos - 1,
 				blockDepth = blockDepth,
@@ -395,6 +470,43 @@ local function safeGetParent(instance: Instance): Instance?
 	return nil
 end
 
+local function safeGetChildren(parent: Instance): { Instance }
+	local ok, children = pcall(function(): { Instance }
+		return parent:GetChildren()
+	end)
+	if ok and type(children) == "table" then
+		return children
+	end
+	return {}
+end
+
+local function safeGetDescendants(parent: Instance): { Instance }
+	local ok, descendants = pcall(function(): { Instance }
+		return parent:GetDescendants()
+	end)
+	if ok and type(descendants) == "table" then
+		return descendants
+	end
+	return {}
+end
+
+local function safeIsModuleScript(inst: Instance): ModuleScript?
+	local ok, isMod = pcall(function(): boolean
+		return inst:IsA("ModuleScript")
+	end)
+	if ok and isMod and inst:IsA("ModuleScript") then
+		return inst
+	end
+	return nil
+end
+
+local function safeIsA(inst: Instance, className: string): boolean
+	local ok, res = pcall(function(): boolean
+		return inst:IsA(className)
+	end)
+	return ok and res == true
+end
+
 local function formatCurrentPath(instance: Instance, root: Instance): string
 	if instance == root then
 		return "game"
@@ -448,7 +560,6 @@ local function normalizeExprRange(tokens: { Token }, startIdx: number, endIdx: n
 		if balancedUntilEnd then
 			s += 1
 			e -= 1
-			-- Also check if inner expression has trailing `:: Type`
 			local innerDepth = 0
 			local innerColon: number? = nil
 			for i = s, e do
@@ -609,132 +720,20 @@ local function evaluateStringRequirePath(
 	}
 end
 
--- Evaluates a sequence of tokens representing an Instance path, string path, or numeric asset ID expression
-local function evaluateInstancePathTokens(
+-- Evaluates chained property/bracket/method accesses starting from a known anchor Instance
+local function evaluateSuffixFromInstance(
+	initialInstance: Instance,
 	tokens: { Token },
 	rawSource: string,
-	startIdx: number,
+	cursorStart: number,
 	endIdx: number,
-	currentScript: DiscoveredScript,
 	root: Instance,
-	aliases: { [string]: PathEvalResult }
+	usedAlias: string?
 ): PathEvalResult
-	local s, e = normalizeExprRange(tokens, startIdx, endIdx)
-	if s > e then
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = nil,
-			failureReason = "Empty require() expression",
-			usedAlias = nil,
-		}
-	end
+	local currentInstance = initialInstance
+	local cursor = cursorStart
 
-	local firstTok = tokens[s]
-	local currentInstance: Instance? = nil
-	local usedAlias: string? = nil
-
-	if firstTok.kind == "Number" and s == e then
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = "rbxassetid://" .. firstTok.value,
-			failureReason = string.format(
-				"Asset ID require (%s): external cloud ModuleScript asset cannot be resolved in the local DataModel (closed-source / external asset)",
-				firstTok.value
-			),
-			usedAlias = nil,
-		}
-	elseif firstTok.kind == "String" then
-		if s == e then
-			return evaluateStringRequirePath(firstTok.value, currentScript, root, nil)
-		end
-		local prefixEval = evaluateStringRequirePath(firstTok.value, currentScript, root, nil)
-		local basePath = if prefixEval.instance ~= nil
-			then formatCurrentPath(prefixEval.instance, root)
-			else prefixEval.partialBasePath
-		return {
-			status = if basePath ~= nil then "PartiallyResolved" else "Unresolved",
-			instance = nil,
-			partialBasePath = basePath,
-			failureReason = string.format(
-				"Dynamic string expression '%s' in require() cannot be statically resolved",
-				string.sub(rawSource, tokens[s].rawStart, tokens[e].rawEnd)
-			),
-			usedAlias = nil,
-		}
-	elseif firstTok.kind == "InterpolatedString" then
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = nil,
-			failureReason = string.format(
-				"Interpolated string %s in require() cannot be statically resolved",
-				firstTok.value
-			),
-			usedAlias = nil,
-		}
-	elseif firstTok.kind ~= "Identifier" then
-		local exprSlice = string.sub(rawSource, tokens[s].rawStart, tokens[e].rawEnd)
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = nil,
-			failureReason = string.format("Dynamic or non-static expression '%s'", exprSlice),
-			usedAlias = nil,
-		}
-	end
-
-	-- Resolve starting anchor identifier
-	local rootIdent = firstTok.value
-	if rootIdent == "script" then
-		currentInstance = currentScript.instance
-	elseif rootIdent == "game" then
-		currentInstance = root
-	elseif rootIdent == "workspace" or rootIdent == "Workspace" then
-		currentInstance = safeFindServiceOrChild(root, "Workspace")
-	elseif aliases[rootIdent] ~= nil then
-		local aliasResult = aliases[rootIdent]
-		usedAlias = rootIdent
-		if aliasResult.instance ~= nil then
-			currentInstance = aliasResult.instance
-		else
-			return {
-				status = aliasResult.status,
-				instance = nil,
-				partialBasePath = aliasResult.partialBasePath,
-				failureReason = string.format(
-					"Local alias '%s' could not be resolved (%s)",
-					rootIdent,
-					aliasResult.failureReason or "unknown base"
-				),
-				usedAlias = rootIdent,
-			}
-		end
-	else
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = nil,
-			failureReason = if s < e and tokens[s + 1].kind == "Symbol" and tokens[s + 1].value == "("
-				then string.format("Dynamic function call '%s(...)' cannot be statically resolved", rootIdent)
-				else string.format("Unresolved variable or dynamic identifier '%s'", rootIdent),
-			usedAlias = nil,
-		}
-	end
-
-	if currentInstance == nil then
-		return {
-			status = "Unresolved",
-			instance = nil,
-			partialBasePath = nil,
-			failureReason = string.format("Base root '%s' is not available in the DataModel", rootIdent),
-			usedAlias = usedAlias,
-		}
-	end
-
-	local cursor = s + 1
-	while cursor <= e do
+	while cursor <= endIdx do
 		local opTok = tokens[cursor]
 
 		-- Ignore inline `:: Type` assertions if encountered mid-chain
@@ -791,11 +790,10 @@ local function evaluateInstancePathTokens(
 
 		-- 2. Bracket access: `["ChildName"]` or `[dynamicExpr]`
 		elseif opTok.kind == "Symbol" and opTok.value == "[" then
-			-- Find matching `]`
 			local bDepth = 1
 			local closeBracketIdx: number? = nil
 			local scanIdx = cursor + 1
-			while scanIdx <= e do
+			while scanIdx <= endIdx do
 				local t = tokens[scanIdx]
 				if t.kind == "Symbol" then
 					if t.value == "[" then
@@ -876,7 +874,13 @@ local function evaluateInstancePathTokens(
 			local openParenTok = tokens[cursor + 2]
 			local basePath = formatCurrentPath(currentInstance, root)
 
-			if methodTok == nil or methodTok.kind ~= "Identifier" or openParenTok == nil or openParenTok.kind ~= "Symbol" or openParenTok.value ~= "(" then
+			if
+				methodTok == nil
+				or methodTok.kind ~= "Identifier"
+				or openParenTok == nil
+				or openParenTok.kind ~= "Symbol"
+				or openParenTok.value ~= "("
+			then
 				return {
 					status = "PartiallyResolved",
 					instance = nil,
@@ -887,11 +891,10 @@ local function evaluateInstancePathTokens(
 			end
 
 			local methodName = methodTok.value
-			-- Find matching `)`
 			local pDepth = 1
 			local closeParenIdx: number? = nil
 			local scanIdx = cursor + 3
-			while scanIdx <= e do
+			while scanIdx <= endIdx do
 				local t = tokens[scanIdx]
 				if t.kind == "Symbol" then
 					if t.value == "(" then
@@ -1060,7 +1063,7 @@ local function evaluateInstancePathTokens(
 
 		else
 			local basePath = formatCurrentPath(currentInstance, root)
-			local remainingRaw = string.sub(rawSource, opTok.rawStart, tokens[e].rawEnd)
+			local remainingRaw = string.sub(rawSource, opTok.rawStart, tokens[endIdx].rawEnd)
 			return {
 				status = "PartiallyResolved",
 				instance = nil,
@@ -1084,205 +1087,774 @@ local function evaluateInstancePathTokens(
 	}
 end
 
--- Extracts unambiguous top-level `local <Ident> = <StaticInstancePath>` aliases that are never reassigned
-local function extractStaticAliases(
+-- Evaluates a sequence of tokens representing an Instance path, string path, or numeric asset ID expression
+local function evaluateInstancePathTokens(
 	tokens: { Token },
 	rawSource: string,
+	startIdx: number,
+	endIdx: number,
 	currentScript: DiscoveredScript,
-	root: Instance
-): { [string]: PathEvalResult }
-	local aliases: { [string]: PathEvalResult } = {}
-	local assignmentCounts: { [string]: number } = {}
-	local count = #tokens
+	root: Instance,
+	aliases: { [string]: PathEvalResult }
+): PathEvalResult
+	local s, e = normalizeExprRange(tokens, startIdx, endIdx)
+	if s > e then
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = nil,
+			failureReason = "Empty require() expression",
+			usedAlias = nil,
+		}
+	end
 
-	-- First pass: count how many times each identifier is assigned (`local x =` or `x =`)
-	for i = 1, count do
-		local tok = tokens[i]
-		if tok.kind == "Identifier" then
-			local prevTok = if i > 1 then tokens[i - 1] else nil
-			local nextTok = if i < count then tokens[i + 1] else nil
-			if prevTok == nil or (prevTok.value ~= "." and prevTok.value ~= ":") then
-				if nextTok ~= nil and nextTok.kind == "Symbol" and nextTok.value == "=" then
-					assignmentCounts[tok.value] = (assignmentCounts[tok.value] or 0) + 1
-				elseif nextTok ~= nil and nextTok.kind == "Symbol" and nextTok.value == ":" then
-					-- Handle `local x: Type = ...`
-					if prevTok ~= nil and prevTok.kind == "Keyword" and prevTok.value == "local" then
-						local scan = i + 2
-						while scan <= count and not (tokens[scan].kind == "Symbol" and tokens[scan].value == "=") do
-							if tokens[scan].line > tok.line + 1 then
-								break
-							end
-							scan += 1
-						end
-						if scan <= count and tokens[scan].kind == "Symbol" and tokens[scan].value == "=" then
-							assignmentCounts[tok.value] = (assignmentCounts[tok.value] or 0) + 1
-						end
-					end
-				end
-			end
+	local firstTok = tokens[s]
+	local currentInstance: Instance? = nil
+	local usedAlias: string? = nil
+
+	if firstTok.kind == "Number" and s == e then
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = "rbxassetid://" .. firstTok.value,
+			failureReason = string.format(
+				"Asset ID require (%s): external cloud ModuleScript asset cannot be resolved in the local DataModel (closed-source / external asset)",
+				firstTok.value
+			),
+			usedAlias = nil,
+		}
+	elseif firstTok.kind == "String" then
+		if s == e then
+			return evaluateStringRequirePath(firstTok.value, currentScript, root, nil)
+		end
+		local prefixEval = evaluateStringRequirePath(firstTok.value, currentScript, root, nil)
+		local basePath = if prefixEval.instance ~= nil
+			then formatCurrentPath(prefixEval.instance, root)
+			else prefixEval.partialBasePath
+		return {
+			status = if basePath ~= nil then "PartiallyResolved" else "Unresolved",
+			instance = nil,
+			partialBasePath = basePath,
+			failureReason = string.format(
+				"Dynamic string expression '%s' in require() cannot be statically resolved",
+				string.sub(rawSource, tokens[s].rawStart, tokens[e].rawEnd)
+			),
+			usedAlias = nil,
+		}
+	elseif firstTok.kind == "InterpolatedString" then
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = nil,
+			failureReason = string.format(
+				"Interpolated string %s in require() cannot be statically resolved",
+				firstTok.value
+			),
+			usedAlias = nil,
+		}
+	elseif firstTok.kind ~= "Identifier" then
+		local exprSlice = string.sub(rawSource, tokens[s].rawStart, tokens[e].rawEnd)
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = nil,
+			failureReason = string.format("Dynamic or non-static expression '%s'", exprSlice),
+			usedAlias = nil,
+		}
+	end
+
+	-- Resolve starting anchor identifier
+	local rootIdent = firstTok.value
+	if rootIdent == "script" then
+		currentInstance = currentScript.instance
+	elseif rootIdent == "game" then
+		currentInstance = root
+	elseif rootIdent == "workspace" or rootIdent == "Workspace" then
+		currentInstance = safeFindServiceOrChild(root, "Workspace")
+	elseif aliases[rootIdent] ~= nil then
+		local aliasResult = aliases[rootIdent]
+		usedAlias = rootIdent
+		if aliasResult.instance ~= nil then
+			currentInstance = aliasResult.instance
+		else
+			return {
+				status = aliasResult.status,
+				instance = nil,
+				partialBasePath = aliasResult.partialBasePath,
+				failureReason = string.format(
+					"Local alias '%s' could not be resolved (%s)",
+					rootIdent,
+					aliasResult.failureReason or "unknown base"
+				),
+				usedAlias = rootIdent,
+			}
+		end
+	else
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = nil,
+			failureReason = if s < e and tokens[s + 1].kind == "Symbol" and tokens[s + 1].value == "("
+				then string.format("Dynamic function call '%s(...)' cannot be statically resolved", rootIdent)
+				else string.format("Unresolved variable or dynamic identifier '%s'", rootIdent),
+			usedAlias = nil,
+		}
+	end
+
+	if currentInstance == nil then
+		return {
+			status = "Unresolved",
+			instance = nil,
+			partialBasePath = nil,
+			failureReason = string.format("Base root '%s' is not available in the DataModel", rootIdent),
+			usedAlias = usedAlias,
+		}
+	end
+
+	return evaluateSuffixFromInstance(currentInstance, tokens, rawSource, s + 1, e, root, usedAlias)
+end
+
+-- Evaluates an iterable/collection expression:
+-- Supports:
+--   * <Container>:GetChildren()
+--   * <Container>:GetDescendants()
+--   * ipairs(<CollectionExpr>) / pairs(<CollectionExpr>)
+--   * Table literals `{ Mod1, Mod2, key = Mod3 }`
+--   * Variable aliases to collections (`local Dependencies = Modules:GetChildren()`)
+--   * Nested loop container variables (`for _, folder in Root:GetChildren() do for _, m in folder:GetChildren() do`)
+local function evaluateCollectionExpression(
+	tokens: { Token },
+	rawSource: string,
+	startIdx: number,
+	endIdx: number,
+	currentScript: DiscoveredScript,
+	root: Instance,
+	aliases: { [string]: PathEvalResult },
+	collections: { [string]: CollectionEvalResult },
+	activeLoops: { [string]: CollectionEvalResult }
+): CollectionEvalResult
+	local s, e = normalizeExprRange(tokens, startIdx, endIdx)
+	if s > e then
+		return {
+			status = "Unresolved",
+			instances = {},
+			basePath = nil,
+			sourceKind = "Unknown",
+			failureReason = "Empty iterable expression",
+			usedAlias = nil,
+		}
+	end
+
+	-- 1. Unwrap `ipairs(...)` or `pairs(...)`
+	if
+		tokens[s].kind == "Identifier"
+		and (tokens[s].value == "ipairs" or tokens[s].value == "pairs")
+		and s + 2 <= e
+		and tokens[s + 1].kind == "Symbol"
+		and tokens[s + 1].value == "("
+		and tokens[e].kind == "Symbol"
+		and tokens[e].value == ")"
+	then
+		s, e = normalizeExprRange(tokens, s + 2, e - 1)
+		if s > e then
+			return {
+				status = "Unresolved",
+				instances = {},
+				basePath = nil,
+				sourceKind = "Unknown",
+				failureReason = "Empty argument inside ipairs/pairs()",
+				usedAlias = nil,
+			}
 		end
 	end
 
-	-- Second pass: evaluate single-assignment `local <Ident> = <PathExpr>` declarations
-	local idx = 1
-	while idx <= count - 3 do
-		local tok = tokens[idx]
-		if tok.kind == "Keyword" and tok.value == "local" and tok.blockDepth == 0 then
-			local identTok = tokens[idx + 1]
-			if identTok ~= nil and identTok.kind == "Identifier" and (assignmentCounts[identTok.value] or 0) == 1 then
-				local eqIdx: number? = nil
-				if tokens[idx + 2].kind == "Symbol" and tokens[idx + 2].value == "=" then
-					eqIdx = idx + 2
-				elseif tokens[idx + 2].kind == "Symbol" and tokens[idx + 2].value == ":" then
-					local scan = idx + 3
-					while scan <= count and scan <= idx + 12 do
-						if tokens[scan].kind == "Symbol" and tokens[scan].value == "=" then
-							eqIdx = scan
-							break
-						end
-						scan += 1
-					end
-				end
+	-- 2. Table literal `{ expr1, expr2, ... }`
+	if
+		tokens[s].kind == "Symbol"
+		and tokens[s].value == "{"
+		and tokens[e].kind == "Symbol"
+		and tokens[e].value == "}"
+	then
+		local instances: { Instance } = {}
+		local hasUnresolvedItem = false
+		local elemStart = s + 1
+		local depth = 0
+		local scan = s + 1
 
-				if eqIdx ~= nil and eqIdx + 1 <= count then
-					local exprStart = eqIdx + 1
-					local exprStartTok = tokens[exprStart]
-					if
-						exprStartTok.kind == "Identifier"
-						and (
-							exprStartTok.value == "game"
-							or exprStartTok.value == "script"
-							or exprStartTok.value == "workspace"
-							or exprStartTok.value == "Workspace"
-							or aliases[exprStartTok.value] ~= nil
-						)
-						and exprStartTok.value ~= "require"
-					then
-						-- Scan the chained path expression `.Foo`, `:Bar(...)`, `["Baz"]`
-						local exprEnd = exprStart
-						local scan = exprStart + 1
-						while scan <= count do
-							local st = tokens[scan]
-							if st.kind == "Symbol" and st.value == "." then
-								if scan + 1 <= count and (tokens[scan + 1].kind == "Identifier" or tokens[scan + 1].kind == "Keyword") then
-									exprEnd = scan + 1
-									scan += 2
-								else
-									break
-								end
-							elseif st.kind == "Symbol" and st.value == ":" then
-								if
-									scan + 2 <= count
-									and tokens[scan + 1].kind == "Identifier"
-									and tokens[scan + 2].kind == "Symbol"
-									and tokens[scan + 2].value == "("
-								then
-									local pDepth = 1
-									local pScan = scan + 3
-									local matchedClose: number? = nil
-									while pScan <= count do
-										if tokens[pScan].kind == "Symbol" then
-											if tokens[pScan].value == "(" then
-												pDepth += 1
-											elseif tokens[pScan].value == ")" then
-												pDepth -= 1
-												if pDepth == 0 then
-													matchedClose = pScan
-													break
-												end
-											end
-										end
-										pScan += 1
-									end
-									if matchedClose ~= nil then
-										exprEnd = matchedClose
-										scan = matchedClose + 1
-									else
-										break
-									end
-								else
-									break
-								end
-							elseif st.kind == "Symbol" and st.value == "[" then
-								local bDepth = 1
-								local bScan = scan + 1
-								local matchedClose: number? = nil
-								while bScan <= count do
-									if tokens[bScan].kind == "Symbol" then
-										if tokens[bScan].value == "[" then
-											bDepth += 1
-										elseif tokens[bScan].value == "]" then
-											bDepth -= 1
-											if bDepth == 0 then
-												matchedClose = bScan
-												break
-											end
-										end
-									end
-									bScan += 1
-								end
-								if matchedClose ~= nil then
-									exprEnd = matchedClose
-									scan = matchedClose + 1
-								else
-									break
-								end
-							else
+		while scan <= e do
+			local tok = tokens[scan]
+			local isDelimiter = (scan == e)
+				or (depth == 0 and tok.kind == "Symbol" and (tok.value == "," or tok.value == ";"))
+
+			if isDelimiter then
+				local elemEnd = scan - 1
+				if elemStart <= elemEnd then
+					-- Check for `key = value` or `[key] = value` inside the table entry
+					local valStart = elemStart
+					local innerDepth = 0
+					for k = elemStart, elemEnd do
+						local kt = tokens[k]
+						if kt.kind == "Symbol" then
+							if kt.value == "(" or kt.value == "[" or kt.value == "{" then
+								innerDepth += 1
+							elseif kt.value == ")" or kt.value == "]" or kt.value == "}" then
+								innerDepth = math.max(0, innerDepth - 1)
+							elseif kt.value == "=" and innerDepth == 0 then
+								valStart = k + 1
 								break
 							end
 						end
+					end
 
-						local evalRes = evaluateInstancePathTokens(
+					if valStart <= elemEnd then
+						local itemEval = evaluateInstancePathTokens(
 							tokens,
 							rawSource,
-							exprStart,
-							exprEnd,
+							valStart,
+							elemEnd,
 							currentScript,
 							root,
 							aliases
 						)
-						if evalRes.instance ~= nil or evalRes.status == "PartiallyResolved" then
-							aliases[identTok.value] = evalRes
+						if itemEval.status == "Resolved" and itemEval.instance ~= nil then
+							table.insert(instances, itemEval.instance)
+						else
+							hasUnresolvedItem = true
 						end
-						idx = exprEnd + 1
-						continue
-					elseif exprStartTok.kind == "String" or exprStartTok.kind == "Number" then
-						local nextAfterLiteral = tokens[exprStart + 1]
-						local isStandaloneLiteral = nextAfterLiteral == nil
-							or nextAfterLiteral.line > exprStartTok.line
-							or (
-								nextAfterLiteral.kind == "Symbol"
-								and nextAfterLiteral.value ~= ".."
-								and nextAfterLiteral.value ~= "+"
-								and nextAfterLiteral.value ~= "-"
-								and nextAfterLiteral.value ~= "*"
-								and nextAfterLiteral.value ~= "/"
-							)
-							or nextAfterLiteral.kind == "Keyword"
-							or nextAfterLiteral.kind == "Identifier"
+					end
+				end
+				elemStart = scan + 1
+			elseif tok.kind == "Symbol" then
+				if tok.value == "(" or tok.value == "[" or tok.value == "{" then
+					depth += 1
+				elseif tok.value == ")" or tok.value == "]" or tok.value == "}" then
+					depth = math.max(0, depth - 1)
+				end
+			end
+			scan += 1
+		end
 
-						if isStandaloneLiteral then
-							local evalRes = evaluateInstancePathTokens(
-								tokens,
-								rawSource,
-								exprStart,
-								exprStart,
-								currentScript,
-								root,
-								aliases
-							)
-							aliases[identTok.value] = evalRes
-							idx = exprStart + 1
-							continue
+		local status: ResolutionStatus = if #instances > 0 and not hasUnresolvedItem
+			then "Resolved"
+			elseif #instances > 0 and hasUnresolvedItem then "PartiallyResolved"
+			else "Unresolved"
+
+		return {
+			status = status,
+			instances = instances,
+			basePath = nil,
+			sourceKind = "TableLiteral",
+			failureReason = if hasUnresolvedItem
+				then "One or more entries in the table literal could not be statically resolved"
+				else nil,
+			usedAlias = nil,
+		}
+	end
+
+	-- 3. `<ContainerExpr>:GetChildren()` or `<ContainerExpr>:GetDescendants()`
+	if
+		e >= s + 4
+		and tokens[e].kind == "Symbol"
+		and tokens[e].value == ")"
+		and tokens[e - 1].kind == "Symbol"
+		and tokens[e - 1].value == "("
+		and tokens[e - 2].kind == "Identifier"
+		and (tokens[e - 2].value == "GetChildren" or tokens[e - 2].value == "GetDescendants")
+		and tokens[e - 3].kind == "Symbol"
+		and tokens[e - 3].value == ":"
+	then
+		local methodName = tokens[e - 2].value
+		local sourceKind: CollectionSourceKind = if methodName == "GetDescendants"
+			then "GetDescendants"
+			else "GetChildren"
+		local prefixEnd = e - 4
+		local firstIdent = tokens[s]
+
+		-- 3a. Prefix starts with an enclosing loop variable (Nested Loops!)
+		if firstIdent.kind == "Identifier" and activeLoops[firstIdent.value] ~= nil then
+			local outerLoop = activeLoops[firstIdent.value]
+			local collected: { Instance } = {}
+			local seenInst: { [Instance]: boolean } = {}
+
+			for _, outerInst in outerLoop.instances do
+				local targetContainer: Instance? = nil
+				if s == prefixEnd then
+					targetContainer = outerInst
+				else
+					local subEval = evaluateSuffixFromInstance(
+						outerInst,
+						tokens,
+						rawSource,
+						s + 1,
+						prefixEnd,
+						root,
+						firstIdent.value
+					)
+					if subEval.status == "Resolved" then
+						targetContainer = subEval.instance
+					end
+				end
+
+				if targetContainer ~= nil then
+					local items: { Instance } = if methodName == "GetDescendants"
+						then safeGetDescendants(targetContainer)
+						else safeGetChildren(targetContainer)
+					for _, child in items do
+						if not seenInst[child] then
+							seenInst[child] = true
+							table.insert(collected, child)
 						end
 					end
 				end
 			end
+
+			return {
+				status = outerLoop.status,
+				instances = collected,
+				basePath = outerLoop.basePath,
+				sourceKind = sourceKind,
+				failureReason = outerLoop.failureReason,
+				usedAlias = firstIdent.value,
+			}
 		end
-		idx += 1
+
+		-- 3b. Standard container expression
+		local containerEval = evaluateInstancePathTokens(
+			tokens,
+			rawSource,
+			s,
+			prefixEnd,
+			currentScript,
+			root,
+			aliases
+		)
+		if containerEval.status == "Resolved" and containerEval.instance ~= nil then
+			local containerInst = containerEval.instance
+			local items = if methodName == "GetDescendants"
+				then safeGetDescendants(containerInst)
+				else safeGetChildren(containerInst)
+			return {
+				status = "Resolved",
+				instances = items,
+				basePath = formatCurrentPath(containerInst, root),
+				sourceKind = sourceKind,
+				failureReason = nil,
+				usedAlias = containerEval.usedAlias,
+			}
+		else
+			return {
+				status = containerEval.status,
+				instances = {},
+				basePath = containerEval.partialBasePath,
+				sourceKind = sourceKind,
+				failureReason = containerEval.failureReason,
+				usedAlias = containerEval.usedAlias,
+			}
+		end
 	end
 
-	return aliases
+	-- 4. Single identifier referencing a Collection variable or Container Instance alias
+	if s == e and tokens[s].kind == "Identifier" then
+		local identName = tokens[s].value
+		local existingCol = collections[identName]
+		if existingCol ~= nil then
+			return {
+				status = existingCol.status,
+				instances = existingCol.instances,
+				basePath = existingCol.basePath,
+				sourceKind = existingCol.sourceKind,
+				failureReason = existingCol.failureReason,
+				usedAlias = identName,
+			}
+		end
+
+		local existingAlias = aliases[identName]
+		if existingAlias ~= nil and existingAlias.instance ~= nil then
+			local inst = existingAlias.instance
+			return {
+				status = "Resolved",
+				instances = safeGetChildren(inst),
+				basePath = formatCurrentPath(inst, root),
+				sourceKind = "InstanceChildren",
+				failureReason = nil,
+				usedAlias = identName,
+			}
+		end
+	end
+
+	-- 5. Fallback: check if the expression itself resolves to a container Instance
+	local fallbackEval = evaluateInstancePathTokens(tokens, rawSource, s, e, currentScript, root, aliases)
+	if fallbackEval.status == "Resolved" and fallbackEval.instance ~= nil then
+		local inst = fallbackEval.instance
+		return {
+			status = "Resolved",
+			instances = safeGetChildren(inst),
+			basePath = formatCurrentPath(inst, root),
+			sourceKind = "InstanceChildren",
+			failureReason = nil,
+			usedAlias = fallbackEval.usedAlias,
+		}
+	end
+
+	return {
+		status = fallbackEval.status,
+		instances = {},
+		basePath = fallbackEval.partialBasePath,
+		sourceKind = "Unknown",
+		failureReason = fallbackEval.failureReason
+			or string.format(
+				"Iterable expression '%s' cannot be statically resolved",
+				string.sub(rawSource, tokens[s].rawStart, tokens[e].rawEnd)
+			),
+		usedAlias = fallbackEval.usedAlias,
+	}
+end
+
+-- Evaluates an atomic condition clause against a candidate Instance for `loopVarName`
+-- Returns: (matches: boolean?, isFullyStatic: boolean, isPureModuleClassCheck: boolean)
+local function evaluateAtomicCondition(
+	tokens: { Token },
+	startIdx: number,
+	endIdx: number,
+	loopVarName: string,
+	candidate: Instance
+): (boolean?, boolean, boolean)
+	local s, e = normalizeExprRange(tokens, startIdx, endIdx)
+	if s > e then
+		return nil, false, false
+	end
+
+	-- Handle `not <subClause>`
+	if tokens[s].kind == "Keyword" and tokens[s].value == "not" and s + 1 <= e then
+		local subMatch, subStatic, _ = evaluateAtomicCondition(tokens, s + 1, e, loopVarName, candidate)
+		if subMatch ~= nil and subStatic then
+			return not subMatch, true, false
+		end
+		return nil, false, false
+	end
+
+	-- Pattern 1: `loopVar:IsA("ClassName")`
+	if
+		e == s + 5
+		and tokens[s].kind == "Identifier"
+		and tokens[s].value == loopVarName
+		and tokens[s + 1].kind == "Symbol"
+		and tokens[s + 1].value == ":"
+		and tokens[s + 2].kind == "Identifier"
+		and tokens[s + 2].value == "IsA"
+		and tokens[s + 3].kind == "Symbol"
+		and tokens[s + 3].value == "("
+		and tokens[s + 4].kind == "String"
+		and tokens[s + 5].kind == "Symbol"
+		and tokens[s + 5].value == ")"
+	then
+		local className = tokens[s + 4].value
+		local matches = safeIsA(candidate, className)
+		local isPureModCheck = (className == "ModuleScript" or className == "LuaSourceContainer")
+		return matches, true, isPureModCheck
+	end
+
+	-- Pattern 2: `loopVar.Name == "Str"` or `loopVar.Name ~= "Str"` or `loopVar.ClassName == "Str"`
+	if
+		e == s + 4
+		and tokens[s].kind == "Identifier"
+		and tokens[s].value == loopVarName
+		and tokens[s + 1].kind == "Symbol"
+		and tokens[s + 1].value == "."
+		and tokens[s + 2].kind == "Identifier"
+		and tokens[s + 3].kind == "Symbol"
+		and (tokens[s + 3].value == "==" or tokens[s + 3].value == "~=")
+		and tokens[s + 4].kind == "String"
+	then
+		local propName = tokens[s + 2].value
+		local op = tokens[s + 3].value
+		local literalVal = tokens[s + 4].value
+
+		if propName == "Name" then
+			local eq = (candidate.Name == literalVal)
+			return if op == "==" then eq else not eq, true, false
+		elseif propName == "ClassName" then
+			local eq = (candidate.ClassName == literalVal)
+			local isPureModCheck = (op == "==" and literalVal == "ModuleScript")
+			return if op == "==" then eq else not eq, true, isPureModCheck
+		end
+	end
+
+	-- Pattern 3: `"Str" == loopVar.Name` or `"Str" ~= loopVar.Name`
+	if
+		e == s + 4
+		and tokens[s].kind == "String"
+		and tokens[s + 1].kind == "Symbol"
+		and (tokens[s + 1].value == "==" or tokens[s + 1].value == "~=")
+		and tokens[s + 2].kind == "Identifier"
+		and tokens[s + 2].value == loopVarName
+		and tokens[s + 3].kind == "Symbol"
+		and tokens[s + 3].value == "."
+		and tokens[s + 4].kind == "Identifier"
+	then
+		local literalVal = tokens[s].value
+		local op = tokens[s + 1].value
+		local propName = tokens[s + 4].value
+
+		if propName == "Name" then
+			local eq = (candidate.Name == literalVal)
+			return if op == "==" then eq else not eq, true, false
+		elseif propName == "ClassName" then
+			local eq = (candidate.ClassName == literalVal)
+			local isPureModCheck = (op == "==" and literalVal == "ModuleScript")
+			return if op == "==" then eq else not eq, true, isPureModCheck
+		end
+	end
+
+	return nil, false, false
+end
+
+-- Evaluates a compound condition (`and` / `or`) against a candidate Instance for `loopVarName`
+local function evaluateConditionForCandidate(
+	tokens: { Token },
+	startIdx: number,
+	endIdx: number,
+	loopVarName: string,
+	candidate: Instance
+): (boolean?, boolean, boolean)
+	local s, e = normalizeExprRange(tokens, startIdx, endIdx)
+	if s > e then
+		return nil, false, false
+	end
+
+	-- Split by top-level `or` first
+	local depth = 0
+	for i = s, e do
+		local tok = tokens[i]
+		if tok.kind == "Symbol" then
+			if tok.value == "(" or tok.value == "[" or tok.value == "{" then
+				depth += 1
+			elseif tok.value == ")" or tok.value == "]" or tok.value == "}" then
+				depth = math.max(0, depth - 1)
+			end
+		elseif tok.kind == "Keyword" and tok.value == "or" and depth == 0 then
+			local leftMatch, leftStatic, leftModCheck =
+				evaluateConditionForCandidate(tokens, s, i - 1, loopVarName, candidate)
+			local rightMatch, rightStatic, rightModCheck =
+				evaluateConditionForCandidate(tokens, i + 1, e, loopVarName, candidate)
+			if leftStatic and rightStatic and leftMatch ~= nil and rightMatch ~= nil then
+				return (leftMatch or rightMatch), true, (leftModCheck and rightModCheck)
+			end
+			return nil, false, false
+		end
+	end
+
+	-- Split by top-level `and`
+	depth = 0
+	for i = s, e do
+		local tok = tokens[i]
+		if tok.kind == "Symbol" then
+			if tok.value == "(" or tok.value == "[" or tok.value == "{" then
+				depth += 1
+			elseif tok.value == ")" or tok.value == "]" or tok.value == "}" then
+				depth = math.max(0, depth - 1)
+			end
+		elseif tok.kind == "Keyword" and tok.value == "and" and depth == 0 then
+			local leftMatch, leftStatic, leftModCheck =
+				evaluateConditionForCandidate(tokens, s, i - 1, loopVarName, candidate)
+			local rightMatch, rightStatic, rightModCheck =
+				evaluateConditionForCandidate(tokens, i + 1, e, loopVarName, candidate)
+			-- If either side is statically false, the conjunction is definitely false!
+			if (leftStatic and leftMatch == false) or (rightStatic and rightMatch == false) then
+				return false, (leftStatic and rightStatic), false
+			end
+			if leftStatic and rightStatic and leftMatch == true and rightMatch == true then
+				return true, true, (leftModCheck and rightModCheck)
+			end
+			return nil, false, false
+		end
+	end
+
+	return evaluateAtomicCondition(tokens, s, e, loopVarName, candidate)
+end
+
+-- Scans the extent of a `local <Ident> = <Expr>` assignment value expression
+local function findAssignmentExprEnd(tokens: { Token }, exprStart: number, count: number): number
+	local exprEnd = exprStart
+	local startTok = tokens[exprStart]
+
+	-- Table literal `{ ... }`
+	if startTok.kind == "Symbol" and startTok.value == "{" then
+		local bDepth = 1
+		local scan = exprStart + 1
+		while scan <= count do
+			if tokens[scan].kind == "Symbol" then
+				if tokens[scan].value == "{" then
+					bDepth += 1
+				elseif tokens[scan].value == "}" then
+					bDepth -= 1
+					if bDepth == 0 then
+						return scan
+					end
+				end
+			end
+			scan += 1
+		end
+		return exprEnd
+	end
+
+	-- Parenthesized expression `( ... )`
+	if startTok.kind == "Symbol" and startTok.value == "(" then
+		local pDepth = 1
+		local scan = exprStart + 1
+		while scan <= count do
+			if tokens[scan].kind == "Symbol" then
+				if tokens[scan].value == "(" then
+					pDepth += 1
+				elseif tokens[scan].value == ")" then
+					pDepth -= 1
+					if pDepth == 0 then
+						exprEnd = scan
+						break
+					end
+				end
+			end
+			scan += 1
+		end
+	end
+
+	-- Standalone String or Number literal
+	if startTok.kind == "String" or startTok.kind == "Number" then
+		return exprStart
+	end
+
+	-- Chained identifier / path / call expression: `a.b:c(...)["d"]`
+	local scan = exprEnd + 1
+	while scan <= count do
+		local st = tokens[scan]
+		if st.kind == "Symbol" and st.value == "." then
+			if scan + 1 <= count and (tokens[scan + 1].kind == "Identifier" or tokens[scan + 1].kind == "Keyword") then
+				exprEnd = scan + 1
+				scan += 2
+			else
+				break
+			end
+		elseif st.kind == "Symbol" and st.value == ":" then
+			if
+				scan + 2 <= count
+				and tokens[scan + 1].kind == "Identifier"
+				and tokens[scan + 2].kind == "Symbol"
+				and tokens[scan + 2].value == "("
+			then
+				local pDepth = 1
+				local pScan = scan + 3
+				local matchedClose: number? = nil
+				while pScan <= count do
+					if tokens[pScan].kind == "Symbol" then
+						if tokens[pScan].value == "(" then
+							pDepth += 1
+						elseif tokens[pScan].value == ")" then
+							pDepth -= 1
+							if pDepth == 0 then
+								matchedClose = pScan
+								break
+							end
+						end
+					end
+					pScan += 1
+				end
+				if matchedClose ~= nil then
+					exprEnd = matchedClose
+					scan = matchedClose + 1
+				else
+					break
+				end
+			else
+				break
+			end
+		elseif st.kind == "Symbol" and st.value == "(" and scan == exprStart + 1 then
+			local pDepth = 1
+			local pScan = scan + 1
+			local matchedClose: number? = nil
+			while pScan <= count do
+				if tokens[pScan].kind == "Symbol" then
+					if tokens[pScan].value == "(" then
+						pDepth += 1
+					elseif tokens[pScan].value == ")" then
+						pDepth -= 1
+						if pDepth == 0 then
+							matchedClose = pScan
+							break
+						end
+					end
+				end
+				pScan += 1
+			end
+			if matchedClose ~= nil then
+				exprEnd = matchedClose
+				scan = matchedClose + 1
+			else
+				break
+			end
+		elseif st.kind == "Symbol" and st.value == "[" then
+			local bDepth = 1
+			local bScan = scan + 1
+			local matchedClose: number? = nil
+			while bScan <= count do
+				if tokens[bScan].kind == "Symbol" then
+					if tokens[bScan].value == "[" then
+						bDepth += 1
+					elseif tokens[bScan].value == "]" then
+						bDepth -= 1
+						if bDepth == 0 then
+							matchedClose = bScan
+							break
+						end
+					end
+				end
+				bScan += 1
+			end
+			if matchedClose ~= nil then
+				exprEnd = matchedClose
+				scan = matchedClose + 1
+			else
+				break
+			end
+		else
+			break
+		end
+	end
+
+	return exprEnd
+end
+
+local function computeCurrentScopeKind(scopeStack: { ScopeFrame }): RequireScopeKind
+	if #scopeStack == 0 then
+		return "TopLevel"
+	end
+	for idx = #scopeStack, 1, -1 do
+		local kind = scopeStack[idx].frameKind
+		if kind == "Conditional" then
+			return "Conditional"
+		elseif kind == "Loop" then
+			return "Loop"
+		elseif kind == "Function" then
+			return "Function"
+		end
+	end
+	return "TopLevel"
+end
+
+local function collectActiveConditions(
+	scopeStack: { ScopeFrame }
+): (boolean, string?, { ScopeFrame })
+	local condFrames: { ScopeFrame } = {}
+	local parts: { string } = {}
+	for _, frame in scopeStack do
+		if frame.frameKind == "Conditional" and frame.condRawText ~= nil then
+			table.insert(condFrames, frame)
+			table.insert(parts, frame.condRawText)
+		end
+	end
+	if #parts == 0 then
+		return false, nil, condFrames
+	end
+	return true, table.concat(parts, " and "), condFrames
 end
 
 function DependencyAnalyzer.analyzeScriptSource(
@@ -1303,22 +1875,517 @@ function DependencyAnalyzer.analyzeScriptSource(
 	end
 
 	local tokens: { Token } = tokensOrErr
-	local aliases = extractStaticAliases(tokens, source, currentScript, root)
 	local count = #tokens
-	local i = 1
 
+	-- First pass: count how many times each identifier is assigned (`local x =` or `x =`)
+	local assignmentCounts: { [string]: number } = {}
+	for idx = 1, count do
+		local tok = tokens[idx]
+		if tok.kind == "Identifier" then
+			local prevTok = if idx > 1 then tokens[idx - 1] else nil
+			local nextTok = if idx < count then tokens[idx + 1] else nil
+			if prevTok == nil or (prevTok.value ~= "." and prevTok.value ~= ":") then
+				if nextTok ~= nil and nextTok.kind == "Symbol" and nextTok.value == "=" then
+					assignmentCounts[tok.value] = (assignmentCounts[tok.value] or 0) + 1
+				elseif nextTok ~= nil and nextTok.kind == "Symbol" and nextTok.value == ":" then
+					if prevTok ~= nil and prevTok.kind == "Keyword" and prevTok.value == "local" then
+						local scan = idx + 2
+						while scan <= count and not (tokens[scan].kind == "Symbol" and tokens[scan].value == "=") do
+							if tokens[scan].line > tok.line + 1 then
+								break
+							end
+							scan += 1
+						end
+						if scan <= count and tokens[scan].kind == "Symbol" and tokens[scan].value == "=" then
+							assignmentCounts[tok.value] = (assignmentCounts[tok.value] or 0) + 1
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local aliases: { [string]: PathEvalResult } = {}
+	local collections: { [string]: CollectionEvalResult } = {}
+	local requireAliases: { [string]: string } = {}
+	local scopeStack: { ScopeFrame } = {}
+
+	local function isRequireIdentifier(identName: string): boolean
+		return identName == "require" or requireAliases[identName] ~= nil
+	end
+
+	local function formatRequireUsedAlias(calleeName: string, pathAlias: string?): string?
+		if calleeName == "require" then
+			return pathAlias
+		end
+		if pathAlias ~= nil and pathAlias ~= "" then
+			return string.format("%s (= require), %s", calleeName, pathAlias)
+		end
+		return string.format("%s (= require)", calleeName)
+	end
+
+	local function getActiveLoopMap(): { [string]: CollectionEvalResult }
+		local map: { [string]: CollectionEvalResult } = {}
+		for _, frame in scopeStack do
+			if frame.frameKind == "Loop" and frame.loopVarName ~= nil and frame.loopEval ~= nil then
+				map[frame.loopVarName] = frame.loopEval
+			end
+		end
+		return map
+	end
+
+	local i = 1
 	while i <= count do
 		local tok = tokens[i]
 		local prevTok = if i > 1 then tokens[i - 1] else nil
+		local isFieldOrProp = prevTok ~= nil
+			and prevTok.kind == "Symbol"
+			and (prevTok.value == "." or prevTok.value == ":")
+
+		-- 1. Track Scope Frames (`for`, `while`, `repeat`, `function`, `if`, `elseif`, `else`, `do`, `end`, `until`)
+		if tok.kind == "Keyword" and not isFieldOrProp then
+			local kw = tok.value
+
+			if kw == "for" then
+				-- Scan header up to matching `do`
+				local doIdx: number? = nil
+				local inIdx: number? = nil
+				local pDepth = 0
+				local scan = i + 1
+				while scan <= count do
+					local st = tokens[scan]
+					if st.kind == "Symbol" then
+						if st.value == "(" or st.value == "{" or st.value == "[" then
+							pDepth += 1
+						elseif st.value == ")" or st.value == "}" or st.value == "]" then
+							pDepth = math.max(0, pDepth - 1)
+						end
+					elseif st.kind == "Keyword" and pDepth == 0 then
+						if st.value == "in" and inIdx == nil then
+							inIdx = scan
+						elseif st.value == "do" then
+							doIdx = scan
+							break
+						end
+					end
+					scan += 1
+				end
+
+				if doIdx ~= nil then
+					if inIdx ~= nil and inIdx > i + 1 and inIdx < doIdx then
+						-- Extract loop variables before `in`
+						local identList: { string } = {}
+						for vIdx = i + 1, inIdx - 1 do
+							if tokens[vIdx].kind == "Identifier" then
+								-- Skip type names after `:` in `for _, m: Instance in ...`
+								local prevV = tokens[vIdx - 1]
+								if prevV == nil or prevV.value ~= ":" then
+									table.insert(identList, tokens[vIdx].value)
+								end
+							end
+						end
+
+						local keyVar: string? = if #identList >= 2 then identList[1] else nil
+						local valVar: string? = if #identList >= 2
+							then identList[2]
+							elseif #identList == 1 then identList[1]
+							else nil
+
+						local activeLoops = getActiveLoopMap()
+						local loopEval = evaluateCollectionExpression(
+							tokens,
+							source,
+							inIdx + 1,
+							doIdx - 1,
+							currentScript,
+							root,
+							aliases,
+							collections,
+							activeLoops
+						)
+
+						pushScopeFrame(scopeStack, {
+							frameKind = "Loop",
+							loopVarName = valVar,
+							loopKeyVarName = keyVar,
+							loopEval = loopEval,
+							condStartIdx = nil,
+							condEndIdx = nil,
+							condRawText = nil,
+							isElseBranch = nil,
+						})
+					else
+						pushScopeFrame(scopeStack, {
+							frameKind = "Loop",
+							loopVarName = nil,
+							loopKeyVarName = nil,
+							loopEval = nil,
+							condStartIdx = nil,
+							condEndIdx = nil,
+							condRawText = nil,
+							isElseBranch = nil,
+						})
+					end
+					i = doIdx + 1
+					continue
+				end
+
+			elseif kw == "while" then
+				local doIdx: number? = nil
+				local pDepth = 0
+				local scan = i + 1
+				while scan <= count do
+					local st = tokens[scan]
+					if st.kind == "Symbol" then
+						if st.value == "(" or st.value == "{" or st.value == "[" then
+							pDepth += 1
+						elseif st.value == ")" or st.value == "}" or st.value == "]" then
+							pDepth = math.max(0, pDepth - 1)
+						end
+					elseif st.kind == "Keyword" and st.value == "do" and pDepth == 0 then
+						doIdx = scan
+						break
+					end
+					scan += 1
+				end
+				pushScopeFrame(scopeStack, {
+					frameKind = "Loop",
+					loopVarName = nil,
+					loopKeyVarName = nil,
+					loopEval = nil,
+					condStartIdx = nil,
+					condEndIdx = nil,
+					condRawText = nil,
+					isElseBranch = nil,
+				})
+				if doIdx ~= nil then
+					i = doIdx + 1
+					continue
+				end
+
+			elseif kw == "repeat" then
+				pushScopeFrame(scopeStack, {
+					frameKind = "Loop",
+					loopVarName = nil,
+					loopKeyVarName = nil,
+					loopEval = nil,
+					condStartIdx = nil,
+					condEndIdx = nil,
+					condRawText = nil,
+					isElseBranch = nil,
+				})
+				i += 1
+				continue
+
+			elseif kw == "function" then
+				pushScopeFrame(scopeStack, {
+					frameKind = "Function",
+					loopVarName = nil,
+					loopKeyVarName = nil,
+					loopEval = nil,
+					condStartIdx = nil,
+					condEndIdx = nil,
+					condRawText = nil,
+					isElseBranch = nil,
+				})
+				i += 1
+				continue
+
+			elseif kw == "if" then
+				-- Check if this is a Luau inline `if a then b else c` ternary expression vs statement `if a then ... end`
+				-- Note: tokenizeLuau increments blockDepth on `then` and decrements on `end`.
+				-- Look ahead to matching `then` at paren depth 0:
+				local thenIdx: number? = nil
+				local pDepth = 0
+				local scan = i + 1
+				while scan <= count do
+					local st = tokens[scan]
+					if st.kind == "Symbol" then
+						if st.value == "(" or st.value == "{" or st.value == "[" then
+							pDepth += 1
+						elseif st.value == ")" or st.value == "}" or st.value == "]" then
+							pDepth = math.max(0, pDepth - 1)
+						end
+					elseif st.kind == "Keyword" and st.value == "then" and pDepth == 0 then
+						thenIdx = scan
+						break
+					end
+					scan += 1
+				end
+
+				if thenIdx ~= nil and thenIdx > i + 1 then
+					local cStart = i + 1
+					local cEnd = thenIdx - 1
+					local condRaw = string.sub(source, tokens[cStart].rawStart, tokens[cEnd].rawEnd)
+					pushScopeFrame(scopeStack, {
+						frameKind = "Conditional",
+						loopVarName = nil,
+						loopKeyVarName = nil,
+						loopEval = nil,
+						condStartIdx = cStart,
+						condEndIdx = cEnd,
+						condRawText = condRaw,
+						isElseBranch = false,
+					})
+					i = thenIdx + 1
+					continue
+				end
+
+			elseif kw == "elseif" then
+				local thenIdx: number? = nil
+				local pDepth = 0
+				local scan = i + 1
+				while scan <= count do
+					local st = tokens[scan]
+					if st.kind == "Symbol" then
+						if st.value == "(" or st.value == "{" or st.value == "[" then
+							pDepth += 1
+						elseif st.value == ")" or st.value == "}" or st.value == "]" then
+							pDepth = math.max(0, pDepth - 1)
+						end
+					elseif st.kind == "Keyword" and st.value == "then" and pDepth == 0 then
+						thenIdx = scan
+						break
+					end
+					scan += 1
+				end
+
+				if thenIdx ~= nil and thenIdx > i + 1 then
+					local cStart = i + 1
+					local cEnd = thenIdx - 1
+					local condRaw = string.sub(source, tokens[cStart].rawStart, tokens[cEnd].rawEnd)
+					if #scopeStack > 0 and scopeStack[#scopeStack].frameKind == "Conditional" then
+						scopeStack[#scopeStack].condStartIdx = cStart
+						scopeStack[#scopeStack].condEndIdx = cEnd
+						scopeStack[#scopeStack].condRawText = condRaw
+						scopeStack[#scopeStack].isElseBranch = false
+					end
+					i = thenIdx + 1
+					continue
+				end
+
+			elseif kw == "else" then
+				if #scopeStack > 0 and scopeStack[#scopeStack].frameKind == "Conditional" then
+					local topFrame = scopeStack[#scopeStack]
+					local prevRaw = topFrame.condRawText or "condition"
+					topFrame.condRawText = "not (" .. prevRaw .. ")"
+					topFrame.isElseBranch = true
+				end
+				i += 1
+				continue
+
+			elseif kw == "do" then
+				pushScopeFrame(scopeStack, {
+					frameKind = "DoBlock",
+					loopVarName = nil,
+					loopKeyVarName = nil,
+					loopEval = nil,
+					condStartIdx = nil,
+					condEndIdx = nil,
+					condRawText = nil,
+					isElseBranch = nil,
+				})
+				i += 1
+				continue
+
+			elseif kw == "end" or kw == "until" then
+				if #scopeStack > 0 then
+					table.remove(scopeStack)
+				end
+				i += 1
+				continue
+
+			-- 2. Track `local <Ident> = <Expr>` single-instance, collection, and `require` function aliases
+			elseif kw == "local" and i + 3 <= count then
+				local identTok = tokens[i + 1]
+				if identTok ~= nil and identTok.kind == "Identifier" and (assignmentCounts[identTok.value] or 0) == 1 then
+					local eqIdx: number? = nil
+					if tokens[i + 2].kind == "Symbol" and tokens[i + 2].value == "=" then
+						eqIdx = i + 2
+					elseif tokens[i + 2].kind == "Symbol" and tokens[i + 2].value == ":" then
+						local scan = i + 3
+						while scan <= count and scan <= i + 24 do
+							if tokens[scan].kind == "Symbol" and tokens[scan].value == "=" then
+								eqIdx = scan
+								break
+							end
+							scan += 1
+						end
+					end
+
+					if eqIdx ~= nil and eqIdx + 1 <= count then
+						local exprStart = eqIdx + 1
+						local exprStartTok = tokens[exprStart]
+						local exprEnd = findAssignmentExprEnd(tokens, exprStart, count)
+						local sNorm, eNorm = normalizeExprRange(tokens, exprStart, exprEnd)
+						local afterExprTok = tokens[exprEnd + 1]
+						local isFollowedByStringCall = afterExprTok ~= nil
+							and (afterExprTok.kind == "String" or afterExprTok.kind == "InterpolatedString")
+
+						-- Check for function alias to `require`: `local a = require` or `local b = a`
+						if
+							sNorm == eNorm
+							and tokens[sNorm].kind == "Identifier"
+							and isRequireIdentifier(tokens[sNorm].value)
+							and not isFollowedByStringCall
+						then
+							requireAliases[identTok.value] = tokens[sNorm].value
+							i = exprEnd + 1
+							continue
+						end
+
+						-- Don't treat `local x = require(...)` or `local x = a(...)` or `local x = a "..."` as a path alias;
+						-- jump to `exprStart` so step 3 analyzes the require call.
+						local isRequireCall = (
+							exprStartTok.kind == "Identifier" and isRequireIdentifier(exprStartTok.value)
+						)
+						if not isRequireCall then
+							-- Check if it's a collection expression (`:GetChildren()`, `:GetDescendants()`, `{...}`, `ipairs/pairs`, or collection alias)
+							local isCollectionSyntax = false
+							if sNorm <= eNorm then
+								if tokens[sNorm].kind == "Symbol" and tokens[sNorm].value == "{" then
+									isCollectionSyntax = true
+								elseif
+									tokens[sNorm].kind == "Identifier"
+									and (
+										tokens[sNorm].value == "ipairs"
+										or tokens[sNorm].value == "pairs"
+										or collections[tokens[sNorm].value] ~= nil
+									)
+								then
+									isCollectionSyntax = true
+								elseif
+									eNorm >= sNorm + 4
+									and tokens[eNorm].value == ")"
+									and tokens[eNorm - 1].value == "("
+									and tokens[eNorm - 2].kind == "Identifier"
+									and (tokens[eNorm - 2].value == "GetChildren" or tokens[eNorm - 2].value == "GetDescendants")
+									and tokens[eNorm - 3].value == ":"
+								then
+									isCollectionSyntax = true
+								end
+							end
+
+							if isCollectionSyntax then
+								local activeLoops = getActiveLoopMap()
+								local colEval = evaluateCollectionExpression(
+									tokens,
+									source,
+									exprStart,
+									exprEnd,
+									currentScript,
+									root,
+									aliases,
+									collections,
+									activeLoops
+								)
+								if colEval.status ~= "Unresolved" or #colEval.instances > 0 then
+									collections[identTok.value] = colEval
+								end
+								i = exprEnd + 1
+								continue
+							elseif
+								exprStartTok.kind == "Identifier"
+								and (
+									exprStartTok.value == "game"
+									or exprStartTok.value == "script"
+									or exprStartTok.value == "workspace"
+									or exprStartTok.value == "Workspace"
+									or aliases[exprStartTok.value] ~= nil
+								)
+							then
+								local evalRes = evaluateInstancePathTokens(
+									tokens,
+									source,
+									exprStart,
+									exprEnd,
+									currentScript,
+									root,
+									aliases
+								)
+								if evalRes.instance ~= nil or evalRes.status == "PartiallyResolved" then
+									aliases[identTok.value] = evalRes
+								end
+								i = exprEnd + 1
+								continue
+							elseif exprStartTok.kind == "String" or exprStartTok.kind == "Number" then
+								local nextAfterLiteral = tokens[exprStart + 1]
+								local isStandaloneLiteral = nextAfterLiteral == nil
+									or nextAfterLiteral.line > exprStartTok.line
+									or (
+										nextAfterLiteral.kind == "Symbol"
+										and nextAfterLiteral.value ~= ".."
+										and nextAfterLiteral.value ~= "+"
+										and nextAfterLiteral.value ~= "-"
+										and nextAfterLiteral.value ~= "*"
+										and nextAfterLiteral.value ~= "/"
+									)
+									or nextAfterLiteral.kind == "Keyword"
+									or nextAfterLiteral.kind == "Identifier"
+
+								if isStandaloneLiteral then
+									local evalRes = evaluateInstancePathTokens(
+										tokens,
+										source,
+										exprStart,
+										exprStart,
+										currentScript,
+										root,
+										aliases
+									)
+									aliases[identTok.value] = evalRes
+									i = exprStart + 1
+									continue
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		-- 2b. Track non-local single-assignment `a = require` (e.g. after `local a`)
+		if
+			tok.kind == "Identifier"
+			and not isFieldOrProp
+			and (prevTok == nil or prevTok.kind ~= "Keyword" or prevTok.value ~= "local")
+			and (assignmentCounts[tok.value] or 0) == 1
+			and i + 2 <= count
+			and tokens[i + 1].kind == "Symbol"
+			and tokens[i + 1].value == "="
+		then
+			local exprStart = i + 2
+			local exprEnd = findAssignmentExprEnd(tokens, exprStart, count)
+			local sNorm, eNorm = normalizeExprRange(tokens, exprStart, exprEnd)
+			local afterExprTok = tokens[exprEnd + 1]
+			local isFollowedByStringCall = afterExprTok ~= nil
+				and (afterExprTok.kind == "String" or afterExprTok.kind == "InterpolatedString")
+			if
+				sNorm == eNorm
+				and tokens[sNorm].kind == "Identifier"
+				and isRequireIdentifier(tokens[sNorm].value)
+				and not isFollowedByStringCall
+			then
+				requireAliases[tok.value] = tokens[sNorm].value
+				i = exprEnd + 1
+				continue
+			end
+		end
+
+		-- 3. Match `require( <arg> )`, `require "StringPath"`, or aliased `a( <arg> )`, `a "StringPath"`
 		local isFieldOrDeclaration = prevTok ~= nil
 			and (
 				(prevTok.kind == "Symbol" and (prevTok.value == "." or prevTok.value == ":"))
 				or (prevTok.kind == "Keyword" and (prevTok.value == "function" or prevTok.value == "local"))
 			)
 
-		-- Match `require( <arg> )`
-		if tok.kind == "Identifier" and tok.value == "require" and not isFieldOrDeclaration then
+		if tok.kind == "Identifier" and isRequireIdentifier(tok.value) and not isFieldOrDeclaration then
+			local calleeName = tok.value
 			local nextTok = tokens[i + 1]
+			local scopeKind: RequireScopeKind = computeCurrentScopeKind(scopeStack)
+			local isTopLevel = (tok.blockDepth == 0)
+			local hasCondition, combinedConditionText, activeCondFrames = collectActiveConditions(scopeStack)
+
 			if nextTok ~= nil and nextTok.kind == "Symbol" and nextTok.value == "(" then
 				local pDepth = 1
 				local closeIdx: number? = nil
@@ -1345,7 +2412,167 @@ function DependencyAnalyzer.analyzeScriptSource(
 					local rawExpr = if argStart <= argEnd
 						then string.sub(source, tokens[argStart].rawStart, tokens[argEnd].rawEnd)
 						else ""
+					local sArg, eArg = normalizeExprRange(tokens, argStart, argEnd)
+					local activeLoops = getActiveLoopMap()
 
+					-- Case A: Require argument starts with an active loop variable (`require(module)` or `require(folder.SubModule)`)
+					if
+						sArg <= eArg
+						and tokens[sArg].kind == "Identifier"
+						and activeLoops[tokens[sArg].value] ~= nil
+					then
+						local loopVarName = tokens[sArg].value
+						local loopEval = activeLoops[loopVarName]
+						local groupId = string.format("%s:L%d:C%d", currentScript.fullPath, tok.line, tok.column)
+
+						-- Filter and resolve candidate ModuleScripts
+						local matchedModules: { ModuleScript } = {}
+						local matchedPaths: { string } = {}
+						local seenPaths: { [string]: boolean } = {}
+						local hasNonTrivialCondition = false
+
+						for _, candInst in loopEval.instances do
+							-- Check all active enclosing conditions against `candInst`
+							local excludedByStaticCond = false
+							for _, condFrame in activeCondFrames do
+								if condFrame.isElseBranch == true then
+									hasNonTrivialCondition = true
+								elseif condFrame.condStartIdx ~= nil and condFrame.condEndIdx ~= nil then
+									local cMatch, cStatic, isPureModCheck = evaluateConditionForCandidate(
+										tokens,
+										condFrame.condStartIdx,
+										condFrame.condEndIdx,
+										loopVarName,
+										candInst
+									)
+									if not isPureModCheck then
+										hasNonTrivialCondition = true
+									end
+									if cStatic and cMatch == false then
+										excludedByStaticCond = true
+										break
+									end
+								else
+									hasNonTrivialCondition = true
+								end
+							end
+
+							if not excludedByStaticCond then
+								local targetInst: Instance? = nil
+								if sArg == eArg then
+									targetInst = candInst
+								else
+									local subEval = evaluateSuffixFromInstance(
+										candInst,
+										tokens,
+										source,
+										sArg + 1,
+										eArg,
+										root,
+										loopVarName
+									)
+									if subEval.status == "Resolved" then
+										targetInst = subEval.instance
+									end
+								end
+
+								if targetInst ~= nil then
+									local modInst = safeIsModuleScript(targetInst)
+									if modInst ~= nil then
+										local modPath = ScriptDiscovery.getCleanFullPath(modInst, root)
+										if not seenPaths[modPath] then
+											seenPaths[modPath] = true
+											table.insert(matchedModules, modInst)
+											table.insert(matchedPaths, modPath)
+										end
+									end
+								end
+							end
+						end
+
+						local dynamicClassification: DependencyClassification = if hasNonTrivialCondition
+							then "Conditional"
+							elseif loopEval.status == "PartiallyResolved" then "DynamicPartial"
+							else "DynamicResolved"
+
+						local loopAliasNote = formatRequireUsedAlias(calleeName, loopEval.usedAlias or loopVarName)
+
+						if #matchedModules > 0 then
+							for _, modInst in matchedModules do
+								local modPath = ScriptDiscovery.getCleanFullPath(modInst, root)
+								pushRecord(records, {
+									requiringScriptPath = currentScript.fullPath,
+									requiringScriptName = currentScript.name,
+									requiringScriptClass = currentScript.className,
+									rawExpression = rawExpr,
+									lineNumber = tok.line,
+									columnNumber = tok.column,
+									isTopLevel = isTopLevel,
+									scopeKind = scopeKind,
+									status = "Resolved",
+									classification = dynamicClassification,
+									isDynamic = true,
+									isConditional = hasCondition,
+									conditionExpression = combinedConditionText,
+									candidateModulePaths = matchedPaths,
+									expansionGroupId = groupId,
+									resolvedModulePath = modPath,
+									resolvedModuleName = modInst.Name,
+									resolvedInstance = modInst,
+									partialBasePath = loopEval.basePath,
+									failureReason = nil,
+									usedAlias = loopAliasNote,
+								})
+							end
+						else
+							local emptyStatus: ResolutionStatus = if loopEval.basePath ~= nil or loopEval.status == "Resolved"
+								then "PartiallyResolved"
+								else "Unresolved"
+							local emptyClass: DependencyClassification = if emptyStatus == "PartiallyResolved"
+								then (if hasNonTrivialCondition then "Conditional" else "DynamicPartial")
+								else "Unresolved"
+							local emptyReason = if loopEval.status ~= "Resolved" and loopEval.failureReason ~= nil
+								then loopEval.failureReason
+								elseif hasNonTrivialCondition and combinedConditionText ~= nil then string.format(
+									"Iterable container '%s' resolved, but 0 ModuleScript candidates matched condition (%s)",
+									loopEval.basePath or loopVarName,
+									combinedConditionText
+								)
+								else string.format(
+									"Iterable container '%s' resolved, but currently contains 0 ModuleScript candidates",
+									loopEval.basePath or loopVarName
+								)
+
+							pushRecord(records, {
+								requiringScriptPath = currentScript.fullPath,
+								requiringScriptName = currentScript.name,
+								requiringScriptClass = currentScript.className,
+								rawExpression = rawExpr,
+								lineNumber = tok.line,
+								columnNumber = tok.column,
+								isTopLevel = isTopLevel,
+								scopeKind = scopeKind,
+								status = emptyStatus,
+								classification = emptyClass,
+								isDynamic = true,
+								isConditional = hasCondition,
+								conditionExpression = combinedConditionText,
+								candidateModulePaths = {},
+								expansionGroupId = groupId,
+								resolvedModulePath = nil,
+								resolvedModuleName = nil,
+								resolvedInstance = nil,
+								partialBasePath = loopEval.basePath,
+								failureReason = emptyReason,
+								usedAlias = loopAliasNote,
+							})
+						end
+
+						i = closeIdx + 1
+						continue
+					end
+
+					-- Case B: Standard static, alias, or non-loop expression
 					local evalRes = evaluateInstancePathTokens(
 						tokens,
 						source,
@@ -1365,13 +2592,11 @@ function DependencyAnalyzer.analyzeScriptSource(
 
 					if evalRes.status == "Resolved" and evalRes.instance ~= nil then
 						local inst = evalRes.instance
-						local okMod, isMod = pcall(function(): boolean
-							return inst:IsA("ModuleScript")
-						end)
-						if okMod and isMod and inst:IsA("ModuleScript") then
-							resolvedInstance = inst
-							resolvedModulePath = ScriptDiscovery.getCleanFullPath(inst, root)
-							resolvedModuleName = inst.Name
+						local modInst = safeIsModuleScript(inst)
+						if modInst ~= nil then
+							resolvedInstance = modInst
+							resolvedModulePath = ScriptDiscovery.getCleanFullPath(modInst, root)
+							resolvedModuleName = modInst.Name
 						else
 							finalStatus = "Unresolved"
 							local nonModPath = ScriptDiscovery.getCleanFullPath(inst, root)
@@ -1384,27 +2609,41 @@ function DependencyAnalyzer.analyzeScriptSource(
 						end
 					end
 
+					local classification: DependencyClassification = if finalStatus == "Resolved"
+						then (if hasCondition then "Conditional" else "Static")
+						elseif finalStatus == "PartiallyResolved" then "DynamicPartial"
+						else "Unresolved"
+					local isDyn = (finalStatus ~= "Resolved")
+
 					pushRecord(records, {
 						requiringScriptPath = currentScript.fullPath,
 						requiringScriptName = currentScript.name,
 						requiringScriptClass = currentScript.className,
 						rawExpression = rawExpr,
 						lineNumber = tok.line,
-						isTopLevel = (tok.blockDepth == 0),
+						columnNumber = tok.column,
+						isTopLevel = isTopLevel,
+						scopeKind = scopeKind,
 						status = finalStatus,
+						classification = classification,
+						isDynamic = isDyn,
+						isConditional = hasCondition,
+						conditionExpression = combinedConditionText,
+						candidateModulePaths = nil,
+						expansionGroupId = nil,
 						resolvedModulePath = resolvedModulePath,
 						resolvedModuleName = resolvedModuleName,
 						resolvedInstance = resolvedInstance,
 						partialBasePath = partialBasePath,
 						failureReason = failureReason,
-						usedAlias = evalRes.usedAlias,
+						usedAlias = formatRequireUsedAlias(calleeName, evalRes.usedAlias),
 					})
 
 					i = closeIdx + 1
 					continue
 				end
 			elseif nextTok ~= nil and nextTok.kind == "String" then
-				-- Handle `require "StringPath"` call syntax without parentheses
+				-- Handle `require "StringPath"` or `a "StringPath"` call syntax without parentheses
 				local evalRes = evaluateStringRequirePath(nextTok.value, currentScript, root, nil)
 				local finalStatus: ResolutionStatus = evalRes.status
 				local resolvedModulePath: string? = nil
@@ -1415,13 +2654,11 @@ function DependencyAnalyzer.analyzeScriptSource(
 
 				if evalRes.status == "Resolved" and evalRes.instance ~= nil then
 					local inst = evalRes.instance
-					local okMod, isMod = pcall(function(): boolean
-						return inst:IsA("ModuleScript")
-					end)
-					if okMod and isMod and inst:IsA("ModuleScript") then
-						resolvedInstance = inst
-						resolvedModulePath = ScriptDiscovery.getCleanFullPath(inst, root)
-						resolvedModuleName = inst.Name
+					local modInst = safeIsModuleScript(inst)
+					if modInst ~= nil then
+						resolvedInstance = modInst
+						resolvedModulePath = ScriptDiscovery.getCleanFullPath(modInst, root)
+						resolvedModuleName = modInst.Name
 					else
 						finalStatus = "Unresolved"
 						local nonModPath = ScriptDiscovery.getCleanFullPath(inst, root)
@@ -1434,20 +2671,62 @@ function DependencyAnalyzer.analyzeScriptSource(
 					end
 				end
 
+				local classification: DependencyClassification = if finalStatus == "Resolved"
+					then (if hasCondition then "Conditional" else "Static")
+					elseif finalStatus == "PartiallyResolved" then "DynamicPartial"
+					else "Unresolved"
+
 				pushRecord(records, {
 					requiringScriptPath = currentScript.fullPath,
 					requiringScriptName = currentScript.name,
 					requiringScriptClass = currentScript.className,
 					rawExpression = string.format("%q", nextTok.value),
 					lineNumber = tok.line,
-					isTopLevel = (tok.blockDepth == 0),
+					columnNumber = tok.column,
+					isTopLevel = isTopLevel,
+					scopeKind = scopeKind,
 					status = finalStatus,
+					classification = classification,
+					isDynamic = (finalStatus ~= "Resolved"),
+					isConditional = hasCondition,
+					conditionExpression = combinedConditionText,
+					candidateModulePaths = nil,
+					expansionGroupId = nil,
 					resolvedModulePath = resolvedModulePath,
 					resolvedModuleName = resolvedModuleName,
 					resolvedInstance = resolvedInstance,
 					partialBasePath = partialBasePath,
 					failureReason = failureReason,
-					usedAlias = evalRes.usedAlias,
+					usedAlias = formatRequireUsedAlias(calleeName, evalRes.usedAlias),
+				})
+				i += 2
+				continue
+			elseif nextTok ~= nil and nextTok.kind == "InterpolatedString" then
+				pushRecord(records, {
+					requiringScriptPath = currentScript.fullPath,
+					requiringScriptName = currentScript.name,
+					requiringScriptClass = currentScript.className,
+					rawExpression = nextTok.value,
+					lineNumber = tok.line,
+					columnNumber = tok.column,
+					isTopLevel = isTopLevel,
+					scopeKind = scopeKind,
+					status = "Unresolved",
+					classification = "Unresolved",
+					isDynamic = true,
+					isConditional = hasCondition,
+					conditionExpression = combinedConditionText,
+					candidateModulePaths = nil,
+					expansionGroupId = nil,
+					resolvedModulePath = nil,
+					resolvedModuleName = nil,
+					resolvedInstance = nil,
+					partialBasePath = nil,
+					failureReason = string.format(
+						"Interpolated string %s in require() cannot be statically resolved",
+						nextTok.value
+					),
+					usedAlias = formatRequireUsedAlias(calleeName, nil),
 				})
 				i += 2
 				continue

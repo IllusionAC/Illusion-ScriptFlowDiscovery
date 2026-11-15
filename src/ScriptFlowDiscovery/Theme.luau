@@ -10,7 +10,9 @@ local Types = require("./Types")
 type ScriptClassName = Types.ScriptClassName
 type ExecutionEnvironment = Types.ExecutionEnvironment
 type ResolutionStatus = Types.ResolutionStatus
+type DependencyClassification = Types.DependencyClassification
 type OrderDeterminism = Types.OrderDeterminism
+type GraphNodeType = Types.GraphNodeType
 
 local Theme = {}
 
@@ -64,6 +66,23 @@ Theme.Colors = {
 	DangerBg = Color3.fromRGB(72, 26, 28),
 	NeutralBadgeText = Color3.fromRGB(175, 182, 195),
 	NeutralBadgeBg = Color3.fromRGB(44, 47, 54),
+
+	-- Graph & Container Visuals
+	ServiceText = Color3.fromRGB(147, 197, 253),
+	ServiceBg = Color3.fromRGB(28, 38, 62),
+	ServiceBorder = Color3.fromRGB(68, 96, 152),
+	ContainerText = Color3.fromRGB(190, 197, 210),
+	ContainerBg = Color3.fromRGB(36, 39, 46),
+	ContainerBorder = Color3.fromRGB(64, 70, 82),
+	DynamicCyanText = Color3.fromRGB(56, 189, 248),
+	DynamicCyanBg = Color3.fromRGB(16, 52, 74),
+	EdgeStructural = Color3.fromRGB(82, 92, 110),
+	EdgeStatic = Color3.fromRGB(52, 211, 153),
+	EdgeDynamic = Color3.fromRGB(56, 189, 248),
+	EdgeConditional = Color3.fromRGB(251, 191, 36),
+	EdgeUnresolved = Color3.fromRGB(248, 113, 113),
+	EdgeIncomingHighlight = Color3.fromRGB(52, 211, 153),
+	EdgeOutgoingHighlight = Color3.fromRGB(168, 85, 247),
 }
 
 Theme.Fonts = {
@@ -126,6 +145,38 @@ function Theme.getOrderCategoryVisuals(category: OrderDeterminism): (string, Col
 		return "POTENTIAL ORDER", Theme.Colors.InfoText, Theme.Colors.InfoBg
 	else
 		return "UNDETERMINED", Theme.Colors.WarningText, Theme.Colors.WarningBg
+	end
+end
+
+function Theme.getClassificationVisuals(classification: DependencyClassification): (string, Color3, Color3)
+	if classification == "Static" then
+		return "STATIC", Theme.Colors.SuccessText, Theme.Colors.SuccessBg
+	elseif classification == "DynamicResolved" then
+		return "DYNAMIC", Theme.Colors.DynamicCyanText, Theme.Colors.DynamicCyanBg
+	elseif classification == "DynamicPartial" then
+		return "DYN PARTIAL", Theme.Colors.OrangeText, Theme.Colors.OrangeBg
+	elseif classification == "Conditional" then
+		return "CONDITIONAL", Theme.Colors.WarningText, Theme.Colors.WarningBg
+	else
+		return "UNRESOLVED", Theme.Colors.DangerText, Theme.Colors.DangerBg
+	end
+end
+
+function Theme.getNodeTypeVisuals(nodeType: GraphNodeType): (string, string, Color3, Color3, Color3)
+	if nodeType == "Service" then
+		return "[SRV]", "Service", Theme.Colors.ServiceText, Theme.Colors.ServiceBg, Theme.Colors.ServiceBorder
+	elseif nodeType == "Folder" then
+		return "[FLD]", "Folder", Theme.Colors.ContainerText, Theme.Colors.ContainerBg, Theme.Colors.ContainerBorder
+	elseif nodeType == "Model" then
+		return "[MDL]", "Model", Theme.Colors.ContainerText, Theme.Colors.ContainerBg, Theme.Colors.ContainerBorder
+	elseif nodeType == "Container" then
+		return "[CNT]", "Container", Theme.Colors.ContainerText, Theme.Colors.ContainerBg, Theme.Colors.ContainerBorder
+	elseif nodeType == "Script" then
+		return "[S]", "Script", Theme.Colors.ScriptText, Theme.Colors.ScriptBg, Theme.Colors.ScriptText
+	elseif nodeType == "LocalScript" then
+		return "[L]", "LocalScript", Theme.Colors.LocalScriptText, Theme.Colors.LocalScriptBg, Theme.Colors.LocalScriptText
+	else
+		return "[M]", "ModuleScript", Theme.Colors.ModuleScriptText, Theme.Colors.ModuleScriptBg, Theme.Colors.ModuleScriptText
 	end
 end
 

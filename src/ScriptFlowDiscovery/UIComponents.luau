@@ -12,10 +12,21 @@ local Theme = require("./Theme")
 
 type ScriptClassName = Types.ScriptClassName
 type ResolutionStatus = Types.ResolutionStatus
+type DependencyClassification = Types.DependencyClassification
 
 export type FilterOption = {
 	id: string,
 	label: string,
+}
+
+export type PanelResizeConfig = {
+	minHeight: number?,
+	maxHeight: number?,
+	minWidth: number?,
+	enableBottom: boolean?,
+	enableRight: boolean?,
+	enableCorner: boolean?,
+	onResized: ((newWidthOffset: number, newHeight: number) -> ())?,
 }
 
 local UIComponents = {}
@@ -204,6 +215,15 @@ function UIComponents.createResolutionBadge(
 	return UIComponents.createBadge(parent, label, textColor, bgColor, layoutOrder)
 end
 
+function UIComponents.createClassificationBadge(
+	parent: Instance,
+	classification: DependencyClassification,
+	layoutOrder: number?
+): TextLabel
+	local label, textColor, bgColor = Theme.getClassificationVisuals(classification)
+	return UIComponents.createBadge(parent, label, textColor, bgColor, layoutOrder)
+end
+
 function UIComponents.createStatCard(
 	parent: Instance,
 	title: string,
@@ -330,20 +350,10 @@ function UIComponents.createSearchInput(
 	UIComponents.createCorner(container, Theme.Sizes.CornerRadius)
 	local stroke = UIComponents.createStroke(container, Theme.Colors.Border, 1)
 
-	local iconLabel = Instance.new("TextLabel")
-	iconLabel.Name = "SearchIcon"
-	iconLabel.Size = UDim2.new(0, 28, 1, 0)
-	iconLabel.BackgroundTransparency = 1
-	iconLabel.Font = Theme.Fonts.Bold
-	iconLabel.TextSize = 13
-	iconLabel.TextColor3 = Theme.Colors.TextMuted
-	iconLabel.Text = "🔎"
-	iconLabel.Parent = container
-
 	local box = Instance.new("TextBox")
 	box.Name = "SearchBox"
-	box.Size = UDim2.new(1, -54, 1, 0)
-	box.Position = UDim2.fromOffset(28, 0)
+	box.Size = UDim2.new(1, -36, 1, 0)
+	box.Position = UDim2.fromOffset(10, 0)
 	box.BackgroundTransparency = 1
 	box.ClearTextOnFocus = false
 	box.Font = Theme.Fonts.Regular
@@ -363,7 +373,7 @@ function UIComponents.createSearchInput(
 	clearBtn.Font = Theme.Fonts.Bold
 	clearBtn.TextSize = 12
 	clearBtn.TextColor3 = Theme.Colors.TextMuted
-	clearBtn.Text = "✕"
+	clearBtn.Text = "X"
 	clearBtn.Visible = false
 	clearBtn.Parent = container
 
@@ -687,6 +697,641 @@ function UIComponents.openScriptInStudio(
 			end)
 		end
 	end)
+end
+
+local function findRootGuiObject(inst: Instance): GuiObject?
+	local current: Instance? = inst
+	local highestGui: GuiObject? = if inst:IsA("GuiObject") then inst else nil
+	while current ~= nil do
+		if current:IsA("LayerCollector") then
+			break
+		end
+		if current:IsA("GuiObject") then
+			highestGui = current
+		end
+		current = current.Parent
+	end
+	return highestGui
+end
+
+local function collectAncestorScrollFrames(inst: Instance): { ScrollingFrame }
+	local list: { ScrollingFrame } = {}
+	local current = inst.Parent
+	while current ~= nil do
+		if current:IsA("ScrollingFrame") then
+			table.insert(list, current)
+		end
+		current = current.Parent
+	end
+	return list
+end
+
+function UIComponents.startInteractiveDrag(
+	handleGui: GuiObject,
+	initialInput: InputObject,
+	onMove: (delta: Vector2) -> (),
+	onEnd: () -> ()
+)
+	local rootGui = findRootGuiObject(handleGui)
+	if rootGui == nil then
+		onEnd()
+		return
+	end
+
+	local pausedScrolls: { ScrollingFrame } = {}
+	for _, sf in collectAncestorScrollFrames(handleGui) do
+		if sf.ScrollingEnabled then
+			sf.ScrollingEnabled = false
+			table.insert(pausedScrolls, sf)
+		end
+	end
+
+	local captureOverlay = Instance.new("TextButton")
+	captureOverlay.Name = "ActiveResizeCaptureOverlay"
+	captureOverlay.Size = UDim2.fromScale(1, 1)
+	captureOverlay.Position = UDim2.fromOffset(0, 0)
+	captureOverlay.BackgroundTransparency = 1
+	captureOverlay.BorderSizePixel = 0
+	captureOverlay.AutoButtonColor = false
+	captureOverlay.Text = ""
+	captureOverlay.ZIndex = 999
+	captureOverlay.Parent = rootGui
+
+	local startMouse = Vector2.new(initialInput.Position.X, initialInput.Position.Y)
+	local active = true
+	local tempConns: { RBXScriptConnection } = {}
+
+	local function finishDrag()
+		if not active then
+			return
+		end
+		active = false
+		for _, conn in tempConns do
+			conn:Disconnect()
+		end
+		table.clear(tempConns)
+		for _, sf in pausedScrolls do
+			if sf.Parent ~= nil then
+				sf.ScrollingEnabled = true
+			end
+		end
+		if captureOverlay.Parent ~= nil then
+			captureOverlay:Destroy()
+		end
+		onEnd()
+	end
+
+	table.insert(
+		tempConns,
+		initialInput.Changed:Connect(function()
+			if
+				initialInput.UserInputState == Enum.UserInputState.End
+				or initialInput.UserInputState == Enum.UserInputState.Cancel
+			then
+				finishDrag()
+			end
+		end)
+	)
+
+	table.insert(
+		tempConns,
+		captureOverlay.InputChanged:Connect(function(input: InputObject)
+			if not active then
+				return
+			end
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				local delta = Vector2.new(input.Position.X - startMouse.X, input.Position.Y - startMouse.Y)
+				onMove(delta)
+			end
+		end)
+	)
+
+	table.insert(
+		tempConns,
+		handleGui.InputChanged:Connect(function(input: InputObject)
+			if not active then
+				return
+			end
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				local delta = Vector2.new(input.Position.X - startMouse.X, input.Position.Y - startMouse.Y)
+				onMove(delta)
+			end
+		end)
+	)
+
+	table.insert(
+		tempConns,
+		captureOverlay.InputEnded:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				finishDrag()
+			end
+		end)
+	)
+
+	table.insert(
+		tempConns,
+		handleGui.InputEnded:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				finishDrag()
+			end
+		end)
+	)
+
+	table.insert(tempConns, captureOverlay.MouseButton1Up:Connect(finishDrag))
+	table.insert(tempConns, captureOverlay.MouseLeave:Connect(finishDrag))
+end
+
+function UIComponents.attachPanelEdgeResizers(
+	targetPanel: Frame,
+	config: PanelResizeConfig,
+	connections: { RBXScriptConnection }
+)
+	local minHeight = config.minHeight or 100
+	local maxHeight = config.maxHeight or 1400
+	local minWidth = config.minWidth or 260
+	local enableBottom = if config.enableBottom ~= nil then config.enableBottom else true
+	local enableRight = if config.enableRight ~= nil then config.enableRight else true
+	local enableCorner = if config.enableCorner ~= nil then config.enableCorner else (enableBottom and enableRight)
+
+	local initialAutoSize = targetPanel.AutomaticSize
+	local initialSize = targetPanel.Size
+	local initialClips = targetPanel.ClipsDescendants
+	local currentWidthOffset = initialSize.X.Offset
+	local currentHeight = initialSize.Y.Offset
+	local heightLocked = false
+
+	local function applyDimensions(newWidthOff: number, newHeightPx: number, lockHeight: boolean)
+		local activeXScale = targetPanel.Size.X.Scale
+		currentWidthOffset = if enableRight then newWidthOff else targetPanel.Size.X.Offset
+		if lockHeight then
+			heightLocked = true
+			currentHeight = newHeightPx
+			targetPanel.AutomaticSize = Enum.AutomaticSize.None
+			targetPanel.ClipsDescendants = true
+			targetPanel.Size = UDim2.new(activeXScale, currentWidthOffset, 0, currentHeight)
+		else
+			if heightLocked then
+				targetPanel.Size = UDim2.new(activeXScale, currentWidthOffset, 0, currentHeight)
+			else
+				targetPanel.Size = UDim2.new(activeXScale, currentWidthOffset, initialSize.Y.Scale, initialSize.Y.Offset)
+			end
+		end
+		if config.onResized ~= nil then
+			config.onResized(currentWidthOffset, targetPanel.AbsoluteSize.Y)
+		end
+	end
+
+	local function resetDimensions()
+		local activeXScale = targetPanel.Size.X.Scale
+		currentWidthOffset = if enableRight then initialSize.X.Offset else targetPanel.Size.X.Offset
+		currentHeight = initialSize.Y.Offset
+		heightLocked = false
+		targetPanel.AutomaticSize = initialAutoSize
+		targetPanel.ClipsDescendants = initialClips
+		targetPanel.Size = UDim2.new(activeXScale, currentWidthOffset, initialSize.Y.Scale, initialSize.Y.Offset)
+		if config.onResized ~= nil then
+			config.onResized(currentWidthOffset, targetPanel.AbsoluteSize.Y)
+		end
+	end
+
+	if enableBottom then
+		local bottomHandle = Instance.new("TextButton")
+		bottomHandle.Name = "BottomResizeHandle"
+		bottomHandle.AnchorPoint = Vector2.new(0, 1)
+		bottomHandle.Position = UDim2.fromScale(0, 1)
+		bottomHandle.Size = UDim2.new(1, if enableCorner then -14 else 0, 0, 7)
+		bottomHandle.BackgroundTransparency = 1
+		bottomHandle.BorderSizePixel = 0
+		bottomHandle.AutoButtonColor = false
+		bottomHandle.Text = ""
+		bottomHandle.ZIndex = 30
+		bottomHandle.Parent = targetPanel
+
+		local bottomGrip = Instance.new("Frame")
+		bottomGrip.Name = "GripPill"
+		bottomGrip.AnchorPoint = Vector2.new(0.5, 0.5)
+		bottomGrip.Position = UDim2.fromScale(0.5, 0.5)
+		bottomGrip.Size = UDim2.fromOffset(42, 3)
+		bottomGrip.BackgroundColor3 = Theme.Colors.Border
+		bottomGrip.BackgroundTransparency = 0.25
+		bottomGrip.BorderSizePixel = 0
+		bottomGrip.ZIndex = 31
+		bottomGrip.Parent = bottomHandle
+		UIComponents.createCorner(bottomGrip, 2)
+
+		local isDraggingBottom = false
+		local lastClickBottom = 0
+
+		table.insert(
+			connections,
+			bottomHandle.MouseEnter:Connect(function()
+				bottomGrip.BackgroundColor3 = Theme.Colors.AccentBlue
+				bottomGrip.BackgroundTransparency = 0
+				bottomGrip.Size = UDim2.fromOffset(56, 3)
+			end)
+		)
+
+		table.insert(
+			connections,
+			bottomHandle.MouseLeave:Connect(function()
+				if not isDraggingBottom then
+					bottomGrip.BackgroundColor3 = Theme.Colors.Border
+					bottomGrip.BackgroundTransparency = 0.25
+					bottomGrip.Size = UDim2.fromOffset(42, 3)
+				end
+			end)
+		)
+
+		table.insert(
+			connections,
+			bottomHandle.InputBegan:Connect(function(input: InputObject)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					local now = os.clock()
+					if (now - lastClickBottom) <= 0.30 then
+						lastClickBottom = 0
+						resetDimensions()
+						return
+					end
+					lastClickBottom = now
+
+					isDraggingBottom = true
+					local startH = targetPanel.AbsoluteSize.Y
+					local startWOff = currentWidthOffset
+					bottomGrip.BackgroundColor3 = Theme.Colors.AccentBlueHover
+					bottomGrip.BackgroundTransparency = 0
+
+					UIComponents.startInteractiveDrag(bottomHandle, input, function(delta: Vector2)
+						local newH = math.clamp(math.round(startH + delta.Y), minHeight, maxHeight)
+						applyDimensions(startWOff, newH, true)
+					end, function()
+						isDraggingBottom = false
+						bottomGrip.BackgroundColor3 = Theme.Colors.Border
+						bottomGrip.BackgroundTransparency = 0.25
+						bottomGrip.Size = UDim2.fromOffset(42, 3)
+					end)
+				end
+			end)
+		)
+	end
+
+	if enableRight then
+		local rightHandle = Instance.new("TextButton")
+		rightHandle.Name = "RightResizeHandle"
+		rightHandle.AnchorPoint = Vector2.new(1, 0)
+		rightHandle.Position = UDim2.fromScale(1, 0)
+		rightHandle.Size = UDim2.new(0, 7, 1, if enableCorner then -14 else 0)
+		rightHandle.BackgroundTransparency = 1
+		rightHandle.BorderSizePixel = 0
+		rightHandle.AutoButtonColor = false
+		rightHandle.Text = ""
+		rightHandle.ZIndex = 30
+		rightHandle.Parent = targetPanel
+
+		local rightGrip = Instance.new("Frame")
+		rightGrip.Name = "GripPill"
+		rightGrip.AnchorPoint = Vector2.new(0.5, 0.5)
+		rightGrip.Position = UDim2.fromScale(0.5, 0.5)
+		rightGrip.Size = UDim2.fromOffset(3, 36)
+		rightGrip.BackgroundColor3 = Theme.Colors.Border
+		rightGrip.BackgroundTransparency = 0.25
+		rightGrip.BorderSizePixel = 0
+		rightGrip.ZIndex = 31
+		rightGrip.Parent = rightHandle
+		UIComponents.createCorner(rightGrip, 2)
+
+		local isDraggingRight = false
+		local lastClickRight = 0
+
+		table.insert(
+			connections,
+			rightHandle.MouseEnter:Connect(function()
+				rightGrip.BackgroundColor3 = Theme.Colors.AccentBlue
+				rightGrip.BackgroundTransparency = 0
+				rightGrip.Size = UDim2.fromOffset(3, 48)
+			end)
+		)
+
+		table.insert(
+			connections,
+			rightHandle.MouseLeave:Connect(function()
+				if not isDraggingRight then
+					rightGrip.BackgroundColor3 = Theme.Colors.Border
+					rightGrip.BackgroundTransparency = 0.25
+					rightGrip.Size = UDim2.fromOffset(3, 36)
+				end
+			end)
+		)
+
+		table.insert(
+			connections,
+			rightHandle.InputBegan:Connect(function(input: InputObject)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					local now = os.clock()
+					if (now - lastClickRight) <= 0.30 then
+						lastClickRight = 0
+						resetDimensions()
+						return
+					end
+					lastClickRight = now
+
+					isDraggingRight = true
+					local startWOff = currentWidthOffset
+					local startAbsW = targetPanel.AbsoluteSize.X
+					local maxReduction = math.max(0, startAbsW - minWidth)
+					local minWOff = startWOff - maxReduction
+					rightGrip.BackgroundColor3 = Theme.Colors.AccentBlueHover
+					rightGrip.BackgroundTransparency = 0
+
+					UIComponents.startInteractiveDrag(rightHandle, input, function(delta: Vector2)
+						local newWOff = math.clamp(math.round(startWOff + delta.X), minWOff, 0)
+						applyDimensions(newWOff, currentHeight, false)
+					end, function()
+						isDraggingRight = false
+						rightGrip.BackgroundColor3 = Theme.Colors.Border
+						rightGrip.BackgroundTransparency = 0.25
+						rightGrip.Size = UDim2.fromOffset(3, 36)
+					end)
+				end
+			end)
+		)
+	end
+
+	if enableCorner then
+		local cornerHandle = Instance.new("TextButton")
+		cornerHandle.Name = "CornerResizeHandle"
+		cornerHandle.AnchorPoint = Vector2.new(1, 1)
+		cornerHandle.Position = UDim2.fromScale(1, 1)
+		cornerHandle.Size = UDim2.fromOffset(14, 14)
+		cornerHandle.BackgroundTransparency = 1
+		cornerHandle.BorderSizePixel = 0
+		cornerHandle.AutoButtonColor = false
+		cornerHandle.Font = Theme.Fonts.Mono
+		cornerHandle.TextSize = 9
+		cornerHandle.TextColor3 = Theme.Colors.TextMuted
+		cornerHandle.Text = "//"
+		cornerHandle.ZIndex = 32
+		cornerHandle.Parent = targetPanel
+
+		local isDraggingCorner = false
+		local lastClickCorner = 0
+
+		table.insert(
+			connections,
+			cornerHandle.MouseEnter:Connect(function()
+				cornerHandle.TextColor3 = Theme.Colors.AccentBlue
+			end)
+		)
+
+		table.insert(
+			connections,
+			cornerHandle.MouseLeave:Connect(function()
+				if not isDraggingCorner then
+					cornerHandle.TextColor3 = Theme.Colors.TextMuted
+				end
+			end)
+		)
+
+		table.insert(
+			connections,
+			cornerHandle.InputBegan:Connect(function(input: InputObject)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					local now = os.clock()
+					if (now - lastClickCorner) <= 0.30 then
+						lastClickCorner = 0
+						resetDimensions()
+						return
+					end
+					lastClickCorner = now
+
+					isDraggingCorner = true
+					local startH = targetPanel.AbsoluteSize.Y
+					local startWOff = currentWidthOffset
+					local startAbsW = targetPanel.AbsoluteSize.X
+					local maxReduction = math.max(0, startAbsW - minWidth)
+					local minWOff = startWOff - maxReduction
+					cornerHandle.TextColor3 = Theme.Colors.AccentBlueHover
+
+					UIComponents.startInteractiveDrag(cornerHandle, input, function(delta: Vector2)
+						local newWOff = math.clamp(math.round(startWOff + delta.X), minWOff, 0)
+						local newH = math.clamp(math.round(startH + delta.Y), minHeight, maxHeight)
+						applyDimensions(newWOff, newH, true)
+					end, function()
+						isDraggingCorner = false
+						cornerHandle.TextColor3 = Theme.Colors.TextMuted
+					end)
+				end
+			end)
+		)
+	end
+end
+
+function UIComponents.attachHorizontalSplitResizer(
+	splitContainer: Frame,
+	leftPanel: Frame,
+	rightPanel: Frame,
+	initialLeftScale: number,
+	minScale: number,
+	maxScale: number,
+	connections: { RBXScriptConnection }
+)
+	local currentScale = initialLeftScale
+
+	local splitterBtn = Instance.new("TextButton")
+	splitterBtn.Name = "HorizontalSplitResizer"
+	splitterBtn.AnchorPoint = Vector2.new(0.5, 0)
+	splitterBtn.Position = UDim2.new(currentScale, 0, 0, 0)
+	splitterBtn.Size = UDim2.new(0, 10, 1, 0)
+	splitterBtn.BackgroundTransparency = 1
+	splitterBtn.BorderSizePixel = 0
+	splitterBtn.AutoButtonColor = false
+	splitterBtn.Text = ""
+	splitterBtn.ZIndex = 25
+	splitterBtn.Parent = splitContainer
+
+	local gripBar = Instance.new("Frame")
+	gripBar.Name = "SplitGrip"
+	gripBar.AnchorPoint = Vector2.new(0.5, 0.5)
+	gripBar.Position = UDim2.fromScale(0.5, 0.5)
+	gripBar.Size = UDim2.fromOffset(3, 40)
+	gripBar.BackgroundColor3 = Theme.Colors.Border
+	gripBar.BackgroundTransparency = 0.2
+	gripBar.BorderSizePixel = 0
+	gripBar.ZIndex = 26
+	gripBar.Parent = splitterBtn
+	UIComponents.createCorner(gripBar, 2)
+
+	local function applySplit(scale: number)
+		currentScale = math.clamp(scale, minScale, maxScale)
+		leftPanel.Size = UDim2.new(currentScale, -5, leftPanel.Size.Y.Scale, leftPanel.Size.Y.Offset)
+		rightPanel.Position = UDim2.new(currentScale, 5, 0, 0)
+		rightPanel.Size = UDim2.new(
+			1 - currentScale,
+			rightPanel.Size.X.Offset,
+			rightPanel.Size.Y.Scale,
+			rightPanel.Size.Y.Offset
+		)
+		splitterBtn.Position = UDim2.new(currentScale, 0, 0, 0)
+	end
+
+	applySplit(initialLeftScale)
+
+	local isDragging = false
+	local lastClick = 0
+
+	table.insert(
+		connections,
+		splitterBtn.MouseEnter:Connect(function()
+			gripBar.BackgroundColor3 = Theme.Colors.AccentBlue
+			gripBar.BackgroundTransparency = 0
+			gripBar.Size = UDim2.fromOffset(4, 56)
+		end)
+	)
+
+	table.insert(
+		connections,
+		splitterBtn.MouseLeave:Connect(function()
+			if not isDragging then
+				gripBar.BackgroundColor3 = Theme.Colors.Border
+				gripBar.BackgroundTransparency = 0.2
+				gripBar.Size = UDim2.fromOffset(3, 40)
+			end
+		end)
+	)
+
+	table.insert(
+		connections,
+		splitterBtn.InputBegan:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				local now = os.clock()
+				if (now - lastClick) <= 0.30 then
+					lastClick = 0
+					applySplit(initialLeftScale)
+					return
+				end
+				lastClick = now
+
+				isDragging = true
+				local startScale = currentScale
+				local totalWidth = math.max(200, splitContainer.AbsoluteSize.X)
+				gripBar.BackgroundColor3 = Theme.Colors.AccentBlueHover
+				gripBar.BackgroundTransparency = 0
+
+				UIComponents.startInteractiveDrag(splitterBtn, input, function(delta: Vector2)
+					local newScale = startScale + (delta.X / totalWidth)
+					applySplit(newScale)
+				end, function()
+					isDragging = false
+					gripBar.BackgroundColor3 = Theme.Colors.Border
+					gripBar.BackgroundTransparency = 0.2
+					gripBar.Size = UDim2.fromOffset(3, 40)
+				end)
+			end
+		end)
+	)
+end
+
+function UIComponents.attachLeftEdgePixelResizer(
+	bodyContainer: Frame,
+	leftViewport: GuiObject,
+	rightPanel: Frame,
+	initialRightWidth: number,
+	minRightWidth: number,
+	maxRightWidth: number,
+	connections: { RBXScriptConnection },
+	onResized: ((newRightWidth: number) -> ())?
+)
+	local currentWidth = initialRightWidth
+
+	local splitterBtn = Instance.new("TextButton")
+	splitterBtn.Name = "InspectorLeftEdgeResizer"
+	splitterBtn.AnchorPoint = Vector2.new(0.5, 0)
+	splitterBtn.Position = UDim2.fromOffset(0, 0)
+	splitterBtn.Size = UDim2.new(0, 8, 1, 0)
+	splitterBtn.BackgroundTransparency = 1
+	splitterBtn.BorderSizePixel = 0
+	splitterBtn.AutoButtonColor = false
+	splitterBtn.Text = ""
+	splitterBtn.ZIndex = 25
+	splitterBtn.Parent = rightPanel
+
+	local gripBar = Instance.new("Frame")
+	gripBar.Name = "SplitGrip"
+	gripBar.AnchorPoint = Vector2.new(0.5, 0.5)
+	gripBar.Position = UDim2.fromScale(0.5, 0.5)
+	gripBar.Size = UDim2.fromOffset(3, 38)
+	gripBar.BackgroundColor3 = Theme.Colors.Border
+	gripBar.BackgroundTransparency = 0.15
+	gripBar.BorderSizePixel = 0
+	gripBar.ZIndex = 26
+	gripBar.Parent = splitterBtn
+	UIComponents.createCorner(gripBar, 2)
+
+	local function applyWidth(widthPx: number)
+		local totalBodyW = bodyContainer.AbsoluteSize.X
+		local effectiveMax = if totalBodyW > 260
+			then math.min(maxRightWidth, math.max(minRightWidth, totalBodyW - 180))
+			else maxRightWidth
+		currentWidth = math.clamp(math.round(widthPx), minRightWidth, effectiveMax)
+		leftViewport.Size = UDim2.new(1, -currentWidth, 1, 0)
+		rightPanel.Size = UDim2.new(0, currentWidth, 1, 0)
+		if onResized ~= nil then
+			onResized(currentWidth)
+		end
+	end
+
+	applyWidth(initialRightWidth)
+
+	local isDragging = false
+	local lastClick = 0
+
+	table.insert(
+		connections,
+		splitterBtn.MouseEnter:Connect(function()
+			gripBar.BackgroundColor3 = Theme.Colors.AccentBlue
+			gripBar.BackgroundTransparency = 0
+			gripBar.Size = UDim2.fromOffset(4, 54)
+		end)
+	)
+
+	table.insert(
+		connections,
+		splitterBtn.MouseLeave:Connect(function()
+			if not isDragging then
+				gripBar.BackgroundColor3 = Theme.Colors.Border
+				gripBar.BackgroundTransparency = 0.15
+				gripBar.Size = UDim2.fromOffset(3, 38)
+			end
+		end)
+	)
+
+	table.insert(
+		connections,
+		splitterBtn.InputBegan:Connect(function(input: InputObject)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				local now = os.clock()
+				if (now - lastClick) <= 0.30 then
+					lastClick = 0
+					applyWidth(initialRightWidth)
+					return
+				end
+				lastClick = now
+
+				isDragging = true
+				local startW = currentWidth
+				gripBar.BackgroundColor3 = Theme.Colors.AccentBlueHover
+				gripBar.BackgroundTransparency = 0
+
+				UIComponents.startInteractiveDrag(splitterBtn, input, function(delta: Vector2)
+					applyWidth(startW - delta.X)
+				end, function()
+					isDragging = false
+					gripBar.BackgroundColor3 = Theme.Colors.Border
+					gripBar.BackgroundTransparency = 0.15
+					gripBar.Size = UDim2.fromOffset(3, 38)
+				end)
+			end
+		end)
+	)
 end
 
 return UIComponents

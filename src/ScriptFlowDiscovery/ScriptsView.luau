@@ -51,10 +51,26 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 	-- =========================================================================
 	-- Top Filter & Search Toolbar
 	-- =========================================================================
-	local filterPanel = UIComponents.createPanel(rootFrame, "FilterToolbar", UDim2.new(1, 0, 0, 148), 1)
+	local filterOuter = UIComponents.createPanel(rootFrame, "FilterToolbar", UDim2.new(1, 0, 0, 148), 1)
+	filterOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+	local filterPanel = Instance.new("Frame")
+	filterPanel.Name = "FilterToolbarContent"
+	filterPanel.Size = UDim2.fromScale(1, 1)
 	filterPanel.AutomaticSize = Enum.AutomaticSize.Y
-	UIComponents.createPadding(filterPanel, 10, 10, 12, 12)
+	filterPanel.BackgroundTransparency = 1
+	filterPanel.Parent = filterOuter
+	UIComponents.createPadding(filterPanel, 10, 12, 12, 14)
 	UIComponents.createListLayout(filterPanel, Enum.FillDirection.Vertical, 7)
+
+	UIComponents.attachPanelEdgeResizers(filterOuter, {
+		minHeight = 84,
+		maxHeight = 320,
+		minWidth = 360,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local topSearchRow = Instance.new("Frame")
 	topSearchRow.Name = "TopSearchRow"
@@ -160,12 +176,12 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 	splitContainer.Parent = rootFrame
 
 	local function syncSplitLayout()
-		local panelHeight = math.max(148, filterPanel.AbsoluteSize.Y)
+		local panelHeight = math.max(84, filterOuter.AbsoluteSize.Y)
 		local topOffset = panelHeight + 8
 		splitContainer.Position = UDim2.fromOffset(0, topOffset)
 		splitContainer.Size = UDim2.new(1, 0, 1, -topOffset)
 	end
-	table.insert(viewConnections, filterPanel:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncSplitLayout))
+	table.insert(viewConnections, filterOuter:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncSplitLayout))
 	syncSplitLayout()
 
 	-- Left List Panel (55% width)
@@ -210,6 +226,35 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 	local detailScroll = UIComponents.createScrollFrame(detailPanel, "DetailScroll", UDim2.fromScale(1, 1), 1)
 	UIComponents.createPadding(detailScroll, 10, 12, 10, 10)
 	UIComponents.createListLayout(detailScroll, Enum.FillDirection.Vertical, 8)
+
+	-- Interactive split resizer between Script List (left) and Script Details (right)
+	UIComponents.attachHorizontalSplitResizer(
+		splitContainer,
+		listPanel,
+		detailPanel,
+		0.55,
+		0.25,
+		0.78,
+		viewConnections
+	)
+
+	-- Edge resizers on both panels
+	UIComponents.attachPanelEdgeResizers(listPanel, {
+		minHeight = 140,
+		maxHeight = 1200,
+		enableBottom = true,
+		enableRight = false,
+		enableCorner = false,
+	}, viewConnections)
+
+	UIComponents.attachPanelEdgeResizers(detailPanel, {
+		minHeight = 140,
+		maxHeight = 1200,
+		minWidth = 220,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local rowFramesByPath: { [string]: TextButton } = {}
 
@@ -442,7 +487,7 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 				depRow.Parent = depsContainer
 				UIComponents.createCorner(depRow, 3)
 
-				local statusBadge = UIComponents.createResolutionBadge(depRow, rec.status, 1)
+				local statusBadge = UIComponents.createClassificationBadge(depRow, rec.classification, 1)
 				statusBadge.Position = UDim2.fromOffset(6, 4)
 
 				local labelText = if rec.status == "Resolved" and rec.resolvedModuleName ~= nil
@@ -450,8 +495,8 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 					else "require(" .. rec.rawExpression .. ")"
 
 				local targetLabel = Instance.new("TextLabel")
-				targetLabel.Size = UDim2.new(1, -165, 1, 0)
-				targetLabel.Position = UDim2.fromOffset(82, 0)
+				targetLabel.Size = UDim2.new(1, -182, 1, 0)
+				targetLabel.Position = UDim2.fromOffset(88, 0)
 				targetLabel.BackgroundTransparency = 1
 				targetLabel.Font = Theme.Fonts.SemiBold
 				targetLabel.TextSize = 12
@@ -462,14 +507,14 @@ function ScriptsView.create(parent: Instance): ScriptsViewInstance
 				targetLabel.Parent = depRow
 
 				local lineScopeLabel = Instance.new("TextLabel")
-				lineScopeLabel.Size = UDim2.new(0, 78, 1, 0)
-				lineScopeLabel.Position = UDim2.new(1, -82, 0, 0)
+				lineScopeLabel.Size = UDim2.new(0, 90, 1, 0)
+				lineScopeLabel.Position = UDim2.new(1, -94, 0, 0)
 				lineScopeLabel.BackgroundTransparency = 1
 				lineScopeLabel.Font = Theme.Fonts.Mono
 				lineScopeLabel.TextSize = 11
 				lineScopeLabel.TextColor3 = Theme.Colors.TextMuted
 				lineScopeLabel.TextXAlignment = Enum.TextXAlignment.Right
-				lineScopeLabel.Text = string.format("L%d · %s", rec.lineNumber, if rec.isTopLevel then "top" else "fn")
+				lineScopeLabel.Text = string.format("L%d:%d · %s", rec.lineNumber, rec.columnNumber, rec.scopeKind)
 				lineScopeLabel.Parent = depRow
 
 				if rec.status == "Resolved" and rec.resolvedModulePath ~= nil then

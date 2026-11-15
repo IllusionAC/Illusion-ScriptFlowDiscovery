@@ -1,15 +1,17 @@
 --!strict
 --[[
 	OverviewView.luau
-	Renders the Overview dashboard (Section 4):
-	- 4.1 Scan Statistics Cards (9 dynamic metrics)
-	- 4.2 Dependency Summary (Most Frequently Required ModuleScripts, Unreferenced Modules, Alerts)
-	- 4.3 Recent Scan Information (Timestamp, Duration, Plugin Script Inclusion, Total Instances Analyzed)
+	Renders the Overview dashboard:
+	- Iteration 3 Section 2: Interactive Game Architecture Diagram (Path2D node-based graph)
+	- Section 4.1: Scan Statistics Cards
+	- Section 4.2: Dependency Summary (Most Frequently Required ModuleScripts, Unreferenced Modules, Alerts)
+	- Section 4.3: Recent Scan Information (Timestamp, Duration, Total Instances Analyzed, Source Access)
 ]]
 
 local Types = require("./Types")
 local Theme = require("./Theme")
 local UIComponents = require("./UIComponents")
+local GraphInteractions = require("./GraphInteractions")
 
 type ScanReport = Types.ScanReport
 type ScriptDependencySummary = Types.ScriptDependencySummary
@@ -37,15 +39,29 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 	UIComponents.createListLayout(rootScroll, Enum.FillDirection.Vertical, 12)
 
 	-- =========================================================================
+	-- Iteration 3 Section 2: Game Architecture Diagram (Main Visual Element)
+	-- =========================================================================
+	local _, _, diagramRightLabel = UIComponents.createSectionHeader(
+		rootScroll,
+		"Game Architecture Diagram",
+		"Interactive DataModel & Dependency Graph",
+		1
+	)
+
+	local diagramWidget = GraphInteractions.createDiagramWidget(rootScroll, 2, {
+		onNavigateToScript = callbacks.onNavigateToScript,
+	})
+
+	-- =========================================================================
 	-- 4.1 Statistics Grid
 	-- =========================================================================
-	local _, _, statsRightLabel = UIComponents.createSectionHeader(rootScroll, "Scan Statistics", "", 1)
+	local _, _, statsRightLabel = UIComponents.createSectionHeader(rootScroll, "Scan Statistics", "", 3)
 
 	local statsGridContainer = Instance.new("Frame")
 	statsGridContainer.Name = "StatsGridContainer"
 	statsGridContainer.Size = UDim2.new(1, 0, 0, 0)
 	statsGridContainer.AutomaticSize = Enum.AutomaticSize.Y
-	statsGridContainer.LayoutOrder = 2
+	statsGridContainer.LayoutOrder = 4
 	statsGridContainer.BackgroundTransparency = 1
 	statsGridContainer.Parent = rootScroll
 
@@ -106,9 +122,9 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 	)
 	local _, valTotalRequires, subTotalRequires = UIComponents.createStatCard(
 		statsGridContainer,
-		"Total require() Calls",
+		"Total Dependencies",
 		"0",
-		"Static calls analyzed",
+		"Static + expanded requires",
 		Theme.Colors.InfoText,
 		7
 	)
@@ -120,34 +136,74 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 		Theme.Colors.SuccessText,
 		8
 	)
+	local _, valDynamicDeps, subDynamicDeps = UIComponents.createStatCard(
+		statsGridContainer,
+		"Dynamic / Loop Deps",
+		"0",
+		"Resolved from loops/aliases",
+		Theme.Colors.DynamicCyanText,
+		9
+	)
 	local cardUnresolved, valUnresolvedDeps, subUnresolvedDeps = UIComponents.createStatCard(
 		statsGridContainer,
 		"Unresolved Dependencies",
 		"0",
 		"Dynamic or missing path",
 		Theme.Colors.OrangeText,
-		9
+		10
 	)
 
 	-- =========================================================================
 	-- 4.2 Dependency Summary
 	-- =========================================================================
-	local _, _, depSummaryRight = UIComponents.createSectionHeader(rootScroll, "Dependency Summary", "", 3)
+	local _, _, depSummaryRight = UIComponents.createSectionHeader(rootScroll, "Dependency Summary", "", 5)
 
-	local depSummaryPanel = UIComponents.createPanel(rootScroll, "DependencySummaryPanel", UDim2.new(1, 0, 0, 0), 4)
+	local depSummaryOuter = UIComponents.createPanel(rootScroll, "DependencySummaryPanel", UDim2.new(1, 0, 0, 0), 6)
+	depSummaryOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+	local depSummaryPanel = Instance.new("Frame")
+	depSummaryPanel.Name = "DependencySummaryContent"
+	depSummaryPanel.Size = UDim2.fromScale(1, 1)
 	depSummaryPanel.AutomaticSize = Enum.AutomaticSize.Y
-	UIComponents.createPadding(depSummaryPanel, 10, 10, 10, 10)
+	depSummaryPanel.BackgroundTransparency = 1
+	depSummaryPanel.Parent = depSummaryOuter
+	UIComponents.createPadding(depSummaryPanel, 10, 14, 10, 14)
 	UIComponents.createListLayout(depSummaryPanel, Enum.FillDirection.Vertical, 8)
+
+	UIComponents.attachPanelEdgeResizers(depSummaryOuter, {
+		minHeight = 90,
+		maxHeight = 900,
+		minWidth = 340,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	-- =========================================================================
 	-- 4.3 Recent Scan Information
 	-- =========================================================================
-	UIComponents.createSectionHeader(rootScroll, "Recent Scan Information", "", 5)
+	UIComponents.createSectionHeader(rootScroll, "Recent Scan Information", "", 7)
 
-	local scanInfoPanel = UIComponents.createPanel(rootScroll, "RecentScanInfoPanel", UDim2.new(1, 0, 0, 0), 6)
+	local scanInfoOuter = UIComponents.createPanel(rootScroll, "RecentScanInfoPanel", UDim2.new(1, 0, 0, 0), 8)
+	scanInfoOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+	local scanInfoPanel = Instance.new("Frame")
+	scanInfoPanel.Name = "RecentScanInfoContent"
+	scanInfoPanel.Size = UDim2.fromScale(1, 1)
 	scanInfoPanel.AutomaticSize = Enum.AutomaticSize.Y
-	UIComponents.createPadding(scanInfoPanel, 10, 10, 10, 10)
+	scanInfoPanel.BackgroundTransparency = 1
+	scanInfoPanel.Parent = scanInfoOuter
+	UIComponents.createPadding(scanInfoPanel, 10, 14, 10, 14)
 	UIComponents.createListLayout(scanInfoPanel, Enum.FillDirection.Vertical, 4)
+
+	UIComponents.attachPanelEdgeResizers(scanInfoOuter, {
+		minHeight = 76,
+		maxHeight = 500,
+		minWidth = 340,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local _, valTimestamp = UIComponents.createKeyValueRow(scanInfoPanel, "Scan Timestamp", "-", nil, 1)
 	local _, valDuration = UIComponents.createKeyValueRow(scanInfoPanel, "Scan Duration", "-", nil, 2)
@@ -161,7 +217,12 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 		table.clear(dynamicConnections)
 
 		for _, child in depSummaryPanel:GetChildren() do
-			if not child:IsA("UILayout") and not child:IsA("UIPadding") and not child:IsA("UICorner") and not child:IsA("UIStroke") then
+			if
+				not child:IsA("UILayout")
+				and not child:IsA("UIPadding")
+				and not child:IsA("UICorner")
+				and not child:IsA("UIStroke")
+			then
 				child:Destroy()
 			end
 		end
@@ -172,10 +233,42 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 		local depAnalysis = report.dependencyAnalysis
 		local execAnalysis = report.executionAnalysis
 
+		-- 1. Update Game Architecture Diagram
+		diagramWidget.setReport(report)
+		local model = diagramWidget.getModel()
+		if model ~= nil then
+			diagramRightLabel.Text = string.format(
+				"%d architecture nodes · %d dependency links",
+				#model.orderedNodes,
+				#model.dependencyEdges
+			)
+		end
+
+		-- Count dynamic & conditional dependencies
+		local dynamicCount = 0
+		local conditionalCount = 0
+		local staticCount = 0
+		for _, rec in depAnalysis.allDependencies do
+			if rec.classification == "Static" then
+				staticCount += 1
+			elseif rec.classification == "DynamicResolved" or rec.classification == "DynamicPartial" then
+				dynamicCount += 1
+			elseif rec.classification == "Conditional" then
+				conditionalCount += 1
+				if rec.isDynamic then
+					dynamicCount += 1
+				end
+			end
+		end
+
 		statsRightLabel.Text = string.format("%d instances scanned", counts.instancesAnalyzed)
 
 		valTotalScripts.Text = tostring(counts.total)
-		subTotalScripts.Text = string.format("%d executable, %d modules", counts.serverScripts + counts.localScripts, counts.moduleScripts)
+		subTotalScripts.Text = string.format(
+			"%d executable, %d modules",
+			counts.serverScripts + counts.localScripts,
+			counts.moduleScripts
+		)
 
 		valServerScripts.Text = tostring(counts.serverScripts)
 		subServerScripts.Text = "ClassName: Script"
@@ -193,14 +286,19 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 		subDormantExec.Text = "Disabled or dormant container"
 
 		valTotalRequires.Text = tostring(#depAnalysis.allDependencies)
-		subTotalRequires.Text = "Total require() expressions"
+		subTotalRequires.Text = string.format("%d static, %d dynamic/cond", staticCount, #depAnalysis.allDependencies - staticCount)
 
 		valResolvedDeps.Text = tostring(#depAnalysis.resolvedDependencies)
 		subResolvedDeps.Text = "Statically linked to modules"
 
+		valDynamicDeps.Text = tostring(dynamicCount)
+		subDynamicDeps.Text = string.format("%d conditional requires", conditionalCount)
+
 		local unresolvedCount = #depAnalysis.unresolvedDependencies
 		valUnresolvedDeps.Text = tostring(unresolvedCount)
-		subUnresolvedDeps.Text = if unresolvedCount == 0 then "All requires resolved" else "Click to inspect in Dependencies"
+		subUnresolvedDeps.Text = if unresolvedCount == 0
+			then "All requires resolved"
+			else "Click to inspect in Dependencies"
 		local unresolvedBar = cardUnresolved:FindFirstChild("AccentBar")
 		if unresolvedBar ~= nil and unresolvedBar:IsA("Frame") then
 			unresolvedBar.BackgroundColor3 = if unresolvedCount == 0
@@ -259,33 +357,63 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 		)
 		UIComponents.createBadge(
 			quickBar,
-			string.format("Resolved: %d", #depAnalysis.resolvedDependencies),
+			string.format("Static: %d", staticCount),
 			Theme.Colors.SuccessText,
 			Theme.Colors.SuccessBg,
 			2
 		)
 		UIComponents.createBadge(
 			quickBar,
-			string.format("Unresolved: %d", unresolvedCount),
-			if unresolvedCount > 0 then Theme.Colors.OrangeText else Theme.Colors.SuccessText,
-			if unresolvedCount > 0 then Theme.Colors.OrangeBg else Theme.Colors.SuccessBg,
+			string.format("Dynamic: %d", dynamicCount),
+			Theme.Colors.DynamicCyanText,
+			Theme.Colors.DynamicCyanBg,
 			3
 		)
 		UIComponents.createBadge(
 			quickBar,
-			string.format("Circular Chains: %d", #depAnalysis.circularChains),
-			if #depAnalysis.circularChains > 0 then Theme.Colors.DangerText else Theme.Colors.NeutralBadgeText,
-			if #depAnalysis.circularChains > 0 then Theme.Colors.DangerBg else Theme.Colors.NeutralBadgeBg,
+			string.format("Conditional: %d", conditionalCount),
+			Theme.Colors.WarningText,
+			Theme.Colors.WarningBg,
 			4
 		)
+		UIComponents.createBadge(
+			quickBar,
+			string.format("Unresolved: %d", unresolvedCount),
+			if unresolvedCount > 0 then Theme.Colors.OrangeText else Theme.Colors.SuccessText,
+			if unresolvedCount > 0 then Theme.Colors.OrangeBg else Theme.Colors.SuccessBg,
+			5
+		)
+		UIComponents.createBadge(
+			quickBar,
+			string.format("Circular Chains: %d", #depAnalysis.circularChains),
+			if #depAnalysis.circularChains > 0 then Theme.Colors.WarningText else Theme.Colors.NeutralBadgeText,
+			if #depAnalysis.circularChains > 0 then Theme.Colors.WarningBg else Theme.Colors.NeutralBadgeBg,
+			6
+		)
+
+		if #depAnalysis.circularChains > 0 then
+			local cycleBetaNote = Instance.new("TextLabel")
+			cycleBetaNote.Name = "CyclicBetaNote"
+			cycleBetaNote.LayoutOrder = 1
+			cycleBetaNote.Size = UDim2.new(1, 0, 0, 0)
+			cycleBetaNote.AutomaticSize = Enum.AutomaticSize.Y
+			cycleBetaNote.BackgroundTransparency = 1
+			cycleBetaNote.Font = Theme.Fonts.Regular
+			cycleBetaNote.TextSize = 11
+			cycleBetaNote.TextColor3 = Theme.Colors.WarningText
+			cycleBetaNote.TextXAlignment = Enum.TextXAlignment.Left
+			cycleBetaNote.TextWrapped = true
+			cycleBetaNote.Text = "Cyclic Modules Note: Circular ModuleScript requires work at top level ONLY if the Roblox Studio Beta feature 'Luau Modularity: Export Values and Cyclic Requires' is enabled (or if deferred inside functions)."
+			cycleBetaNote.Parent = depSummaryPanel
+		end
 
 		if unresolvedCount > 0 then
 			UIComponents.createButton(
 				quickBar,
-				"Inspect Unresolved →",
+				"Inspect Unresolved ->",
 				UDim2.fromOffset(132, 22),
 				false,
-				5,
+				7,
 				function()
 					callbacks.onNavigateToDependencies("Unresolved")
 				end,
@@ -452,7 +580,7 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 			allUsedLbl.TextSize = 12
 			allUsedLbl.TextColor3 = Theme.Colors.SuccessText
 			allUsedLbl.TextXAlignment = Enum.TextXAlignment.Left
-			allUsedLbl.Text = "Every discovered ModuleScript has at least one static require() caller."
+			allUsedLbl.Text = "Every discovered ModuleScript has at least one static or dynamic require() caller."
 			allUsedLbl.Parent = depSummaryPanel
 		else
 			local unusedFlow = Instance.new("Frame")
@@ -503,6 +631,7 @@ function OverviewView.create(parent: Instance, callbacks: OverviewCallbacks): Ov
 
 	local function destroy()
 		clearDynamicDeps()
+		diagramWidget.destroy()
 		for _, conn in viewConnections do
 			conn:Disconnect()
 		end

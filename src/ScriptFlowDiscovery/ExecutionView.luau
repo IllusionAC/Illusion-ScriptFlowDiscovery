@@ -54,10 +54,26 @@ function ExecutionView.create(parent: Instance, callbacks: ExecutionCallbacks): 
 	-- =========================================================================
 	-- Top Filter & Search Bar
 	-- =========================================================================
-	local filterPanel = UIComponents.createPanel(rootFrame, "ExecFilterToolbar", UDim2.new(1, 0, 0, 114), 1)
+	local filterOuter = UIComponents.createPanel(rootFrame, "ExecFilterToolbar", UDim2.new(1, 0, 0, 114), 1)
+	filterOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+	local filterPanel = Instance.new("Frame")
+	filterPanel.Name = "ExecFilterToolbarContent"
+	filterPanel.Size = UDim2.fromScale(1, 1)
 	filterPanel.AutomaticSize = Enum.AutomaticSize.Y
-	UIComponents.createPadding(filterPanel, 10, 10, 12, 12)
+	filterPanel.BackgroundTransparency = 1
+	filterPanel.Parent = filterOuter
+	UIComponents.createPadding(filterPanel, 10, 12, 12, 14)
 	UIComponents.createListLayout(filterPanel, Enum.FillDirection.Vertical, 7)
+
+	UIComponents.attachPanelEdgeResizers(filterOuter, {
+		minHeight = 76,
+		maxHeight = 300,
+		minWidth = 360,
+		enableBottom = true,
+		enableRight = true,
+		enableCorner = true,
+	}, viewConnections)
 
 	local rebuildContent: () -> ()
 
@@ -124,12 +140,12 @@ function ExecutionView.create(parent: Instance, callbacks: ExecutionCallbacks): 
 	UIComponents.createListLayout(mainScroll, Enum.FillDirection.Vertical, 10)
 
 	local function syncScrollLayout()
-		local panelHeight = math.max(114, filterPanel.AbsoluteSize.Y)
+		local panelHeight = math.max(76, filterOuter.AbsoluteSize.Y)
 		local topOffset = panelHeight + 8
 		mainScroll.Position = UDim2.fromOffset(0, topOffset)
 		mainScroll.Size = UDim2.new(1, 0, 1, -topOffset)
 	end
-	table.insert(viewConnections, filterPanel:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncScrollLayout))
+	table.insert(viewConnections, filterOuter:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncScrollLayout))
 	syncScrollLayout()
 
 	local function itemMatchesFilters(item: ExecutionConstraintItem): boolean
@@ -195,15 +211,31 @@ function ExecutionView.create(parent: Instance, callbacks: ExecutionCallbacks): 
 		local badgeLabel, accentText, accentBg = Theme.getOrderCategoryVisuals(categoryKey)
 		local isCollapsed = sectionCollapsed[categoryKey] == true
 
-		local sectionContainer = UIComponents.createPanel(
+		local sectionOuter = UIComponents.createPanel(
 			mainScroll,
 			"Section_" .. categoryKey,
 			UDim2.new(1, 0, 0, 0),
 			layoutOrder
 		)
+		sectionOuter.AutomaticSize = Enum.AutomaticSize.Y
+
+		local sectionContainer = Instance.new("Frame")
+		sectionContainer.Name = "SectionContent"
+		sectionContainer.Size = UDim2.fromScale(1, 1)
 		sectionContainer.AutomaticSize = Enum.AutomaticSize.Y
-		UIComponents.createPadding(sectionContainer, 8, 8, 10, 10)
+		sectionContainer.BackgroundTransparency = 1
+		sectionContainer.Parent = sectionOuter
+		UIComponents.createPadding(sectionContainer, 8, 12, 10, 14)
 		UIComponents.createListLayout(sectionContainer, Enum.FillDirection.Vertical, 8)
+
+		UIComponents.attachPanelEdgeResizers(sectionOuter, {
+			minHeight = 54,
+			maxHeight = 1200,
+			minWidth = 340,
+			enableBottom = true,
+			enableRight = true,
+			enableCorner = true,
+		}, contentConnections)
 
 		-- Clickable Expand/Collapse Section Header
 		local headerBtn = Instance.new("TextButton")

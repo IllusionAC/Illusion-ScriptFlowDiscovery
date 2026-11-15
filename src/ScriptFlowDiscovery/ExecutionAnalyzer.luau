@@ -50,13 +50,17 @@ local function computeTopLevelModuleSequence(
 			if rec.status == "Resolved" and rec.resolvedModulePath ~= nil then
 				local targetPath = rec.resolvedModulePath
 				local targetName = rec.resolvedModuleName or targetPath
-				local scopeTag = if rec.isTopLevel then "top-level" else "deferred/inner-scope"
+				local scopeTag = if rec.isTopLevel
+					then "top-level"
+					elseif rec.scopeKind == "Loop" then "loop-candidate (" .. rec.classification .. ")"
+					elseif rec.scopeKind == "Conditional" then "conditional"
+					else "function-scope"
 				if not visited[targetPath] then
 					visited[targetPath] = true
-					if rec.isTopLevel then
+					if rec.isTopLevel and not rec.isDynamic and not rec.isConditional then
 						visit(targetPath)
 					end
-					table.insert(sequence, string.format("%s (%s, line %d)", targetPath, scopeTag, rec.lineNumber))
+					table.insert(sequence, string.format("%s (%s, line %d:%d)", targetPath, scopeTag, rec.lineNumber, rec.columnNumber))
 					table.insert(steps, {
 						stepIndex = #steps + 1,
 						scriptPath = targetPath,
@@ -690,6 +694,24 @@ function ExecutionAnalyzer.analyzeExecution(
 				steps = prof.orderedSteps,
 			})
 		end
+	end
+
+	-- Cyclic ModuleScript Chains (Beta-Dependent Execution Order)
+	for cIdx, chain in dependencyAnalysis.circularChains do
+		local firstModulePath = chain[1]
+		local firstProf = if firstModulePath ~= nil then profilesByPath[firstModulePath] else nil
+		local envLabel = if firstProf ~= nil then tostring(firstProf.environment) else "SharedModule"
+		pushConstraint(potentialOrders, {
+			category = "PotentialOrder",
+			environment = envLabel,
+			title = string.format("Cyclic Module Dependency Chain #%d (%s)", cIdx, table.concat(chain, " -> ")),
+			description = "Circular ModuleScript require() cycle detected. Top-level cyclic requires work ONLY if the Roblox Studio Beta feature 'Luau Modularity: Export Values and Cyclic Requires' is enabled (or if the mutual require() calls are deferred inside functions).",
+			relatedScripts = chain,
+			subjectScriptPath = firstModulePath,
+			sourceLine = nil,
+			conditions = "Conditional on Studio Beta: Works at top level only when 'Luau Modularity: Export Values and Cyclic Requires' beta feature is enabled; otherwise throws a recursive require error / deadlocks at runtime unless deferred inside a function.",
+			steps = nil,
+		})
 	end
 
 	-- 3. Undetermined Execution Order Groups

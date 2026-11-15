@@ -42,7 +42,7 @@ local function appendDependencySubtree(
 		local isLast = (idx == totalDeps)
 		local branch = if isLast then "└── " else "├── "
 		local childPrefix = prefix .. (if isLast then "    " else "│   ")
-		local scopeNote = if rec.isTopLevel then "top-level" else "inner-scope"
+		local scopeNote = string.format("%s, %s", rec.scopeKind, rec.classification)
 
 		if rec.status == "Resolved" and rec.resolvedModulePath ~= nil then
 			local targetPath = rec.resolvedModulePath
@@ -50,18 +50,27 @@ local function appendDependencySubtree(
 				table.insert(
 					lines,
 					string.format(
-						"%s%s%s [line %d, %s] (CIRCULAR REFERENCE)",
+						"%s%s%s [line %d:%d, %s] (CIRCULAR REFERENCE)",
 						prefix,
 						branch,
 						targetPath,
 						rec.lineNumber,
+						rec.columnNumber,
 						scopeNote
 					)
 				)
 			else
 				table.insert(
 					lines,
-					string.format("%s%s%s [line %d, %s]", prefix, branch, targetPath, rec.lineNumber, scopeNote)
+					string.format(
+						"%s%s%s [line %d:%d, %s]",
+						prefix,
+						branch,
+						targetPath,
+						rec.lineNumber,
+						rec.columnNumber,
+						scopeNote
+					)
 				)
 				local nextAncestors: { [string]: boolean } = {}
 				for k, v in ancestorSet do
@@ -74,12 +83,14 @@ local function appendDependencySubtree(
 			table.insert(
 				lines,
 				string.format(
-					"%s%s[UNRESOLVED: %s] require(%s) [line %d]",
+					"%s%s[UNRESOLVED: %s / %s] require(%s) [line %d:%d]",
 					prefix,
 					branch,
 					rec.status,
+					rec.classification,
 					rec.rawExpression,
-					rec.lineNumber
+					rec.lineNumber,
+					rec.columnNumber
 				)
 			)
 		end
@@ -253,6 +264,10 @@ function OutputFormatter.formatReport(report: ScanReport): string
 
 	if #depAnalysis.circularChains > 0 then
 		table.insert(lines, "[CIRCULAR MODULE DEPENDENCIES DETECTED]")
+		table.insert(
+			lines,
+			"  Note: Cyclic ModuleScript requires work at top level ONLY if the Studio Beta feature 'Luau Modularity: Export Values and Cyclic Requires' is enabled (or if deferred inside functions)."
+		)
 		for idx, chain in depAnalysis.circularChains do
 			table.insert(lines, string.format("  %d. %s", idx, table.concat(chain, " -> ")))
 		end
